@@ -382,6 +382,7 @@ amendments/YYYY-MM-DD_<简短描述>.md
 | 2026-08-04 | — | 完成 TODO-1 代码部分（多作物改造，`nc` 提交 `bbb7e9c`）+ TODO-2（`63_audit_weather_alignment.py`）。附录 B 勾选更新 | amendments/2026-08-04_w0-multicrop-and-audit-script.md |
 | 2026-08-04 | — | 完成 TODO-3（小麦/大豆阶段窗口文献确认，`nc` 提交 `80d772f`）。附录 B 勾选更新 | amendments/2026-08-04_todo3-crop-stage-windows-literature.md |
 | 2026-08-04 | — | 完成 TODO-4（T3 小麦 / SoyNAM 物候记录普查：抽穗/开花日期确认可得，G1 物候条款可满足）。附录 B 勾选更新 | amendments/2026-08-04_todo4-t3-phenology-census.md |
+| 2026-08-04 | — | W1 数据普查实证：T3 小麦门户 9,139 试验；SDSU 春小麦 83 个环境带抽穗期物候；坐标缺失→NOAA 站点 ID；播期缺失→抽穗期锚定方案 | amendments/2026-08-04_w1-census-findings.md |
 
 ---
 
