@@ -73,6 +73,7 @@ def load_wheat(envs_to_use: int, seed: int) -> tuple[list[dict], list[str]]:
     counts = df.groupby("env_id")["gen"].count()
     usable = counts[counts >= 12].index
     df = df[df["env_id"].isin(usable)]
+    df = df.dropna(subset=["yld"])  # ESWYT has ~129 NaN yields; drop to keep MSE finite
     rng = np.random.default_rng(seed)
     envs = sorted(rng.choice(sorted(df["env_id"].unique()), size=min(envs_to_use, len(usable)), replace=False))
     df = df[df["env_id"].isin(envs)].copy()
