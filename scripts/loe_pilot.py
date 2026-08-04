@@ -53,6 +53,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--strata", type=int, default=0,
                         help="Distance-stratified env sampling (improvement #4): number of bins (>0 enables)")
     parser.add_argument("--target", type=int, default=30, help="Target envs after stratified sampling")
+    parser.add_argument("--batch-size", type=int, default=128,
+                        help="Training batch size (raise to 512-1024 on A100 for GPU efficiency)")
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="DataLoader workers (0 = main process; >0 avoids data loading stalls)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args(argv)
 
@@ -125,6 +129,8 @@ def run_loe(
     epochs: int,
     device: str,
     seed: int,
+    batch_size: int = 128,
+    num_workers: int = 0,
 ) -> dict:
     """Run leave-one-environment-out; returns per-env {pcc_gz, pcc_ge, delta}."""
     envs = sorted(set(i["env_id"] for i in items))
@@ -176,7 +182,14 @@ def run_loe(
             return ds_items
 
         train_ds = EnvYieldDataset(build_dataset(train_items), {i["env_id"]: train_env_mean.get(i["env_id"], global_mean) for i in train_items})
-        train_loader = DataLoader(train_ds, batch_size=128, collate_fn=collate, shuffle=True)
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            collate_fn=collate,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=device.startswith("cuda"),
+        )
 
         module = EnvIndexModule(
             n_stages=items[0]["x"].shape[0],
@@ -252,7 +265,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.strata > 0:
         w_items = _apply_strata(w_items, args.strata, args.target, args.device)
         print(f"[loe_pilot] wheat stratified -> {len(set(i['env_id'] for i in w_items))} envs")
-    w_res = run_loe(w_items, len(set(i["geno"] for i in w_items)), args.d_embed, args.d_geno, args.rank, args.epochs, args.device, args.seed)
+    w_res = run_loe(w_items, len(set(i["geno"] for i in w_items)), args.d_embed, args.d_geno, args.rank, args.epochs, args.device, args.seed,
+                    batch_size=args.batch_size, num_workers=args.num_workers)
 
     print("[loe_pilot] loading corn G2F ...")
     c_items, c_envs = load_corn(args.n_envs_corn, args.seed)
@@ -260,7 +274,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.strata > 0:
         c_items = _apply_strata(c_items, args.strata, args.target, args.device)
         print(f"[loe_pilot] corn stratified -> {len(set(i['env_id'] for i in c_items))} envs")
-    c_res = run_loe(c_items, len(set(i["geno"] for i in c_items)), args.d_embed, args.d_geno, args.rank, args.epochs, args.device, args.seed)
+    c_res = run_loe(c_items, len(set(i["geno"] for i in c_items)), args.d_embed, args.d_geno, args.rank, args.epochs, args.device, args.seed,
+                    batch_size=args.batch_size, num_workers=args.num_workers)
 
     def summarize(name, res):
         rows = list(res.values())
