@@ -156,6 +156,25 @@ def test_is_phenology_trait_t3_ontology_names():
     assert t3.variable_name(var) == "Anthesis time - Julian date (JD)"
 
 
+def test_is_phenology_trait_ignores_description_keywords():
+    """Trait descriptions contain stage words ('...at maturity...'); they must
+    not trigger detection (regression: Spike shattering false positive)."""
+    var = {
+        "observationVariableName": "Spike shattering - 0-9 percentage scale|CO_321:0501143",
+        "trait": {
+            "traitName": "Spike shattering - 0-9 percentage scale",
+            "traitDescription": "Observation of grains dehiscence from spike at maturity.",
+        },
+        "scale": {"unit": "0-9"},
+    }
+    assert t3.is_phenology_trait(var) is False
+    # Same variable with a genuinely phenological name still matches.
+    var2 = dict(var)
+    var2["observationVariableName"] = "Heading time - Julian date (JD)|CO_321:0001233"
+    var2["trait"]["traitName"] = "Heading time - Julian date (JD)"
+    assert t3.is_phenology_trait(var2) is True
+
+
 def test_census_flags_phenology_and_filters_program():
     routes = {
         "programs": {"result": {"data": [_program("University of Nebraska", "P1"), _program("Other", "P2")], "pagination": {}}},

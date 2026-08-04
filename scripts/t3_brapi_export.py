@@ -219,12 +219,24 @@ def _get(variable: dict, *keys: str, default: Any = None) -> Any:
 
 
 def is_phenology_trait(var: dict) -> bool:
-    """Heuristic: does this observation variable look like a phenology trait?"""
-    name = str(
-        _get(var, "observationVariableName", "traitName", "name", default="")
-    ).lower()
-    trait_name = str(_get(var, "trait", "traitName", default="")).lower()
-    method = str(_get(var, "method", "methodName", default="")).lower()
+    """Heuristic: does this observation variable look like a phenology trait?
+
+    Only trait NAME (not description) feeds the keyword match — descriptions
+    contain generic stage words ("...at maturity...") that cause false
+    positives (e.g. "Spike shattering - 0-9 percentage scale").
+    """
+    name = str(_get(var, "observationVariableName", "name", default="")).lower()
+    trait = _get(var, "trait", default={})
+    trait_name = ""
+    if isinstance(trait, dict):
+        trait_name = str(trait.get("traitName", "")).lower()
+    elif trait:
+        trait_name = str(trait).lower()
+    method = _get(var, "method", default="")
+    if isinstance(method, dict):
+        method = str(method.get("methodName", "")).lower()
+    else:
+        method = str(method).lower()
     haystack = " ".join([name, trait_name, method])
     return any(kw in haystack for kw in PHENOLOGY_KEYWORDS)
 
