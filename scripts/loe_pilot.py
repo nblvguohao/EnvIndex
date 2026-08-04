@@ -270,7 +270,12 @@ def _init_worker(items, params, counter, lock):
 def _run_fold_worker(held):
     global _SHARED
     items = _SHARED["items"]
-    d_embed, d_geno, rank, epochs, batch_size, num_workers, seed = _SHARED["params"]
+    params = _SHARED["params"]
+    n_held = len([i for i in items if i["env_id"] == held])
+    if n_held == 0:
+        print(f"[worker] WARN no items for held={held}", flush=True)
+        return held, {}
+    d_embed, d_geno, rank, epochs, batch_size, num_workers, seed = params
     return _run_one_fold(items, held, d_embed, d_geno, rank, epochs, "cuda", seed, batch_size, num_workers)
 
 
