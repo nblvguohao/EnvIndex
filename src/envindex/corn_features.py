@@ -15,13 +15,15 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-# corn stage windows (DAP) — from the maize crop profile (crop_profiles.py)
-CORN_STAGE_WINDOWS = [
-    ("early", 0, 30),
-    ("vegetative", 31, 60),
-    ("flowering", 61, 90),
-    ("grain_fill", 91, 130),
-    ("late", 131, 180),
+# Corn stage boundaries in GROWING DEGREE DAYS (base 10 C / 50 F), the
+# protocol §6 primary stage mechanism.  GDD targets from corn development
+# literature (base 10 C): V6 ~475, VT ~1100, R1 ~1400, R5 ~1900, R6 ~2450.
+CORN_STAGE_GDD_WINDOWS = [
+    ("early", 0.0, 475.0),
+    ("vegetative", 475.0, 1100.0),
+    ("flowering", 1100.0, 1400.0),
+    ("grain_fill", 1400.0, 1900.0),
+    ("late", 1900.0, 2450.0),
 ]
 
 WEATHER_VARS = ["tmax", "tmin", "tmean", "precipitation", "solar_radiation", "relative_humidity"]
@@ -30,8 +32,20 @@ STATS = ["mean", "min", "max", "std"]
 BASE_TEMP_C = 10.0
 
 
+def _gdd(tmax: pd.Series, tmin: pd.Series, base: float = BASE_TEMP_C) -> pd.Series:
+    """Corn GDD: (tmax+tmin)/2 - base, floored at 0, capped tmax at 30 C."""
+    tmax = tmax.clip(upper=30.0)
+    return np.maximum(0.0, (tmax + tmin) / 2.0 - base)
+
+
 def anchor_planting_date(env_weather: pd.DataFrame, base_temp: float = BASE_TEMP_C) -> pd.Timestamp | None:
-    """Return the date where the 7-day rolling mean tmean first >= base_temp."""
+    """Return the date where the 7-day rolling mean tmean first >= base_temp.
+
+    Used as the GDD-accumulation origin (season anchor).  Exact planting dates
+    are not present in the G2F processed data (documented in
+    reports/loe_pilot_results_2026-08-04.md); this thermal anchor is the
+    protocol-compliant fallback (GDD-primary stage mechanism).
+    """
     if env_weather.empty or "tmean" not in env_weather.columns:
         return None
     w = env_weather.sort_values("_weather_date").copy()
@@ -49,20 +63,26 @@ def anchor_planting_date(env_weather: pd.DataFrame, base_temp: float = BASE_TEMP
 def build_corn_stage_features(env_weather: pd.DataFrame) -> tuple[np.ndarray, pd.Timestamp | None]:
     """Build a (n_stages, F) stage-summary matrix for one corn environment.
 
-    Returns (matrix, planting_anchor).
+    Stage boundaries are defined by accumulated GDD (base 10 C) from the
+    season anchor (protocol §6 GDD-primary mechanism), replacing the crude
+    calendar-DAP approximation.  Returns (matrix, season_anchor).
     """
+    n_feats = len(WEATHER_VARS) * len(STATS)
+    zero = np.zeros((len(CORN_STAGE_GDD_WINDOWS), n_feats), dtype=np.float32)
     if env_weather.empty or "_weather_date" not in env_weather.columns:
-        return np.zeros((len(CORN_STAGE_WINDOWS), len(WEATHER_VARS) * len(STATS)), dtype=np.float32), None
+        return zero, None
 
     anchor = anchor_planting_date(env_weather)
     if anchor is None:
-        return np.zeros((len(CORN_STAGE_WINDOWS), len(WEATHER_VARS) * len(STATS)), dtype=np.float32), None
+        return zero, None
 
     w = env_weather.dropna(subset=["_weather_date"]).copy()
-    w["_dap"] = (pd.to_datetime(w["_weather_date"]) - anchor).dt.days
-    mat = np.zeros((len(CORN_STAGE_WINDOWS), len(WEATHER_VARS) * len(STATS)), dtype=np.float32)
-    for si, (_name, start, end) in enumerate(CORN_STAGE_WINDOWS):
-        stage = w[(w["_dap"] >= start) & (w["_dap"] <= end)]
+    w["_gdd"] = _gdd(pd.to_numeric(w["tmax"], errors="coerce"), pd.to_numeric(w["tmin"], errors="coerce"))
+    w["_cum_gdd"] = w.sort_values("_weather_date")["_gdd"].cumsum()
+
+    mat = np.zeros((len(CORN_STAGE_GDD_WINDOWS), n_feats), dtype=np.float32)
+    for si, (_name, start, end) in enumerate(CORN_STAGE_GDD_WINDOWS):
+        stage = w[(w["_cum_gdd"] > start) & (w["_cum_gdd"] <= end)]
         col = 0
         for var in WEATHER_VARS:
             vals = pd.to_numeric(stage[var], errors="coerce").dropna().to_numpy()
