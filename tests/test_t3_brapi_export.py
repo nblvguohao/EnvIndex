@@ -179,3 +179,50 @@ def test_no_trials_matched_returns_empty_catalog():
     client = _client_with(routes)
     catalog, _ = t3.build_trials_catalog(client)
     assert len(catalog) == 0
+
+
+def test_login_fetch_token_and_extract():
+    """Verify the login helper parses the real T3 v1 token response shape."""
+    import importlib
+    import importlib.util as iu
+
+    # Load t3_login.py as a sibling module under a registered name.
+    login_script = Path(__file__).resolve().parents[1] / "scripts" / "t3_login.py"
+    lspec = iu.spec_from_file_location("t3_login", login_script)
+    login_mod = iu.module_from_spec(lspec)
+    sys.modules["t3_login"] = login_mod
+    lspec.loader.exec_module(login_mod)
+
+    # Response shape matches what T3 v1 returned in the connectivity probe.
+    payload = {
+        "expires_in": 7200,
+        "access_token": "tok123",
+        "userDisplayName": "user",
+        "metadata": {"status": []},
+    }
+    assert login_mod._extract_access_token(payload) == "tok123"
+    # Nested variant (some v2 deployments).
+    nested = {"result": {"access_token": "tok456"}}
+    assert login_mod._extract_access_token(nested) == "tok456"
+    assert login_mod._extract_access_token({"result": {}}) is None
+
+
+def test_resolve_token_priority(tmp_path, monkeypatch):
+    """--token beats env beats token file; each fallback works."""
+    # 1. explicit token wins
+    assert t3._resolve_token("explicit") == "explicit"
+
+    # 2. env var used when no explicit token
+    monkeypatch.setenv("T3_TOKEN", "from_env")
+    assert t3._resolve_token(None) == "from_env"
+
+    # 3. token file used when nothing else set
+    monkeypatch.delenv("T3_TOKEN", raising=False)
+    token_file = tmp_path / ".t3_token"
+    token_file.write_text("from_file", encoding="utf-8")
+    monkeypatch.setattr(t3, "DEFAULT_TOKEN_FILE", token_file)
+    assert t3._resolve_token(None) == "from_file"
+
+    # 4. nothing set -> None
+    monkeypatch.setattr(t3, "DEFAULT_TOKEN_FILE", tmp_path / "missing_token")
+    assert t3._resolve_token(None) is None

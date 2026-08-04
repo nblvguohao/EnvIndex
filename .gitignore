@@ -45,3 +45,7 @@ Thumbs.db
 .env
 venv/
 .venv/
+
+# T3 credentials / tokens
+.t3_token
+data/t3/.t3_token

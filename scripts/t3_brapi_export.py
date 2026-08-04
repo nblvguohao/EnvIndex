@@ -57,6 +57,9 @@ DEFAULT_BASE_URLS = {
     "oat": "https://oat.triticeaetoolbox.org/",
 }
 
+# Token file written by t3_login.py; read automatically if T3_TOKEN is unset.
+DEFAULT_TOKEN_FILE = Path("data/t3/.t3_token")
+
 # Trait-name keywords used to identify phenology traits in a trial's
 # observationVariable list.  Kept broad because T3 trials use heterogeneous
 # naming (e.g. "Heading date", "Days to heading", "Anthesis", "Zadoks").
@@ -353,10 +356,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _resolve_token(token: str | None) -> str | None:
+    """Token priority: --token > T3_TOKEN env > token file from t3_login.py."""
+    if token:
+        return token
+    token = os.environ.get("T3_TOKEN")
+    if token:
+        return token
+    if DEFAULT_TOKEN_FILE.exists():
+        return DEFAULT_TOKEN_FILE.read_text(encoding="utf-8").strip()
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     base_url = args.base_url or DEFAULT_BASE_URLS[args.crop]
-    token = args.token or os.environ.get("T3_TOKEN")
+    token = _resolve_token(args.token)
     client = BrApiClient(base_url=base_url, token=token, sleep_seconds=args.sleep)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
