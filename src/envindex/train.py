@@ -22,7 +22,12 @@ from envindex.encoder import EnvMeanHead, InteractionHead, MLPMixerEncoder, info
 
 
 class EnvIndexModule(nn.Module):
-    """Bundle: encoder + aux A head + main interaction head."""
+    """Bundle: encoder + aux A head + main interaction head.
+
+    Genotype handling (protocol §4.3): pass a precomputed genotype embedding
+    `g_emb`, OR set `n_genotypes` to learn a genotype embedding from
+    `geno_idx` directly (learnable genotype embedding).
+    """
 
     def __init__(
         self,
@@ -33,6 +38,7 @@ class EnvIndexModule(nn.Module):
         rank: int = 2,
         n_static: int = 0,
         n_genotypes: int | None = None,
+        learn_geno_emb: bool = True,
     ) -> None:
         super().__init__()
         self.encoder = MLPMixerEncoder(
@@ -42,6 +48,9 @@ class EnvIndexModule(nn.Module):
             n_static=n_static,
         )
         self.aux_env_mean = EnvMeanHead(d_embed)
+        self.geno_embedding: nn.Embedding | None = None
+        if learn_geno_emb and n_genotypes is not None:
+            self.geno_embedding = nn.Embedding(n_genotypes, d_geno)
         self.main_head = InteractionHead(
             d_geno=d_geno,
             d_embed=d_embed,
@@ -56,11 +65,20 @@ class EnvIndexModule(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        g_emb: torch.Tensor,
+        g_emb: torch.Tensor | None = None,
         geno_idx: torch.Tensor | None = None,
         static: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (y_hat, env_mean_hat, z)."""
+        """Returns (y_hat, env_mean_hat, z).
+
+        Either `g_emb` (B, d_geno) or `geno_idx` (B,) ints is required; if
+        `geno_idx` is given and a learnable genotype embedding is configured,
+        `g_emb` is looked up from it.
+        """
+        if g_emb is None:
+            if self.geno_embedding is None or geno_idx is None:
+                raise ValueError("need g_emb or (geno_idx with learnable embedding)")
+            g_emb = self.geno_embedding(geno_idx)
         z = self.encode(x, static)
         y_hat = self.main_head(z, g_emb, geno_idx)
         env_mean_hat = self.aux_env_mean(z)
@@ -94,10 +112,11 @@ class EnvYieldDataset(Dataset):
             static = []
         elif isinstance(static, torch.Tensor) and static.numel() == 0:
             static = static
+        g_emb = it.get("g_emb")
         return {
             "x": torch.as_tensor(it["x"], dtype=torch.float32),
             "static": torch.as_tensor(static, dtype=torch.float32),
-            "g_emb": torch.as_tensor(it["g_emb"], dtype=torch.float32),
+            "g_emb": torch.as_tensor(g_emb, dtype=torch.float32) if g_emb is not None else None,
             "geno_idx": torch.as_tensor(it.get("geno_idx", -1), dtype=torch.long),
             "y": torch.as_tensor(it["y"], dtype=torch.float32),
             "env_mean": torch.as_tensor(self.env_mean_by_id[it["env_id"]], dtype=torch.float32),
@@ -106,10 +125,12 @@ class EnvYieldDataset(Dataset):
 
 
 def collate(items: list[dict]) -> dict:
+    g_embs = [i["g_emb"] for i in items]
+    has_g_emb = any(g is not None for g in g_embs)
     return {
         "x": torch.stack([i["x"] for i in items]),
         "static": torch.stack([i["static"] for i in items]),
-        "g_emb": torch.stack([i["g_emb"] for i in items]),
+        "g_emb": torch.stack([g for g in g_embs if g is not None]) if has_g_emb else None,
         "geno_idx": torch.stack([i["geno_idx"] for i in items]),
         "y": torch.stack([i["y"] for i in items]),
         "env_mean": torch.stack([i["env_mean"] for i in items]),
@@ -131,7 +152,7 @@ def train_epoch(
     for batch in loader:
         x = batch["x"].to(device)
         static = batch["static"].to(device)
-        g_emb = batch["g_emb"].to(device)
+        g_emb = batch["g_emb"].to(device) if batch["g_emb"] is not None else None
         geno_idx = batch["geno_idx"].to(device)
         y = batch["y"].to(device)
         env_mean = batch["env_mean"].to(device)
@@ -169,7 +190,7 @@ def evaluate(
     for batch in loader:
         x = batch["x"].to(device)
         static = batch["static"].to(device)
-        g_emb = batch["g_emb"].to(device)
+        g_emb = batch["g_emb"].to(device) if batch["g_emb"] is not None else None
         geno_idx = batch["geno_idx"].to(device)
         y_hat, env_mean_hat, _ = module(x, g_emb, geno_idx, static)
         ys.append(batch["y"])

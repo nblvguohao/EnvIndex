@@ -50,6 +50,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--d-geno", type=int, default=16)
     parser.add_argument("--rank", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--strata", type=int, default=0,
+                        help="Distance-stratified env sampling (improvement #4): number of bins (>0 enables)")
+    parser.add_argument("--target", type=int, default=30, help="Target envs after stratified sampling")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args(argv)
 
@@ -130,8 +133,6 @@ def run_loe(
     UNK = len(geno2idx)
     rng = np.random.default_rng(seed)
 
-    geno_emb = nn.Embedding(len(geno2idx) + 1, d_geno).to(device)
-
     results = {}
     for held in envs:
         train_items = [i for i in items if i["env_id"] != held]
@@ -159,12 +160,11 @@ def run_loe(
             for i in source:
                 x = (np.nan_to_num(i["x"]) - x_mean) / x_std
                 gidx = geno2idx.get(i["geno"], UNK)
-                gemb = geno_emb(torch.tensor([gidx], device=device)).detach().cpu().squeeze(0).numpy()
                 ds_items.append(
                     {
                         "x": x,
                         "static": None,
-                        "g_emb": gemb,
+                        "g_emb": None,  # learnable via geno_idx (improvement #1)
                         "geno_idx": gidx,
                         "geno": i["geno"],
                         "y": i["y"],
@@ -193,7 +193,7 @@ def run_loe(
             for batch in train_loader:
                 x = batch["x"].to(device)
                 static = batch["static"].to(device)
-                g = batch["g_emb"].to(device)
+                g = batch["g_emb"].to(device) if batch["g_emb"] is not None else None
                 idx = batch["geno_idx"].to(device)
                 y = batch["y"].to(device)
                 y_hat, env_hat, z = module(x, g, idx, static)
@@ -205,24 +205,38 @@ def run_loe(
         # predict held-out
         module.eval()
         hd = build_dataset(held_items)
-        ys, gz_pred, ge_pred = [], [], []
+        ys, gz_pred, ge_pred, gm_pred, rz_pred = [], [], [], [], []
         with torch.no_grad():
             for it in hd:
                 x = torch.as_tensor(it["x"], dtype=torch.float32).unsqueeze(0).to(device)
                 st_raw = it["static"] if it["static"] is not None else []
                 st = torch.as_tensor(st_raw, dtype=torch.float32).unsqueeze(0).to(device)
-                g = torch.as_tensor(it["g_emb"], dtype=torch.float32).unsqueeze(0).to(device)
                 idx = torch.as_tensor([it["geno_idx"]], dtype=torch.long).to(device)
-                y_hat, _, _ = module(x, g, idx, st)
+                y_hat, _, _ = module(x, None, idx, st)  # learnable geno embedding
                 gz_pred.append(float(y_hat.squeeze().cpu()))
                 ys.append(it["y"])
                 # G+E additive baseline: env mean + genotype deviation
                 gdev = geno_train_mean.get(it["geno"], global_mean) - global_mean
                 ge_pred.append(float(it["env_mean"] + gdev))
+                # genotype-mean baseline (GBLUP-G-lite)
+                gm_pred.append(geno_train_mean.get(it["geno"], global_mean))
+                # random-embedding negative control (protocol §5-12): G+E with random z
+                rz = torch.randn(d_embed, device=device)
+                rz_y = module.main_head.bias + module.main_head.env_main(rz.unsqueeze(0)).squeeze(0) \
+                    + (module.geno_embedding(idx) @ module.main_head.U * (rz.unsqueeze(0) @ module.main_head.V)).sum(-1).squeeze(0)
+                rz_pred.append(float(rz_y.squeeze().cpu()))
         ys = np.array(ys)
         pcc_gz = _pcc(ys, np.array(gz_pred))
         pcc_ge = _pcc(ys, np.array(ge_pred))
-        results[held] = {"pcc_gz": pcc_gz, "pcc_ge": pcc_ge, "delta": pcc_gz - pcc_ge}
+        pcc_gm = _pcc(ys, np.array(gm_pred))
+        pcc_rz = _pcc(ys, np.array(rz_pred))
+        results[held] = {
+            "pcc_gz": pcc_gz,
+            "pcc_ge": pcc_ge,
+            "pcc_gm": pcc_gm,
+            "pcc_rz": pcc_rz,
+            "delta": pcc_gz - pcc_ge,
+        }
 
     return results
 
@@ -235,27 +249,78 @@ def main(argv: list[str] | None = None) -> int:
     print("[loe_pilot] loading wheat ESWYT ...")
     w_items, w_envs = load_wheat(args.n_envs_wheat, args.seed)
     print(f"[loe_pilot] wheat: {len(w_items)} rows, {len(w_envs)} envs")
+    if args.strata > 0:
+        w_items = _apply_strata(w_items, args.strata, args.target, args.device)
+        print(f"[loe_pilot] wheat stratified -> {len(set(i['env_id'] for i in w_items))} envs")
     w_res = run_loe(w_items, len(set(i["geno"] for i in w_items)), args.d_embed, args.d_geno, args.rank, args.epochs, args.device, args.seed)
 
     print("[loe_pilot] loading corn G2F ...")
     c_items, c_envs = load_corn(args.n_envs_corn, args.seed)
     print(f"[loe_pilot] corn: {len(c_items)} rows, {len(c_envs)} envs")
+    if args.strata > 0:
+        c_items = _apply_strata(c_items, args.strata, args.target, args.device)
+        print(f"[loe_pilot] corn stratified -> {len(set(i['env_id'] for i in c_items))} envs")
     c_res = run_loe(c_items, len(set(i["geno"] for i in c_items)), args.d_embed, args.d_geno, args.rank, args.epochs, args.device, args.seed)
 
     def summarize(name, res):
         rows = list(res.values())
         gz = [r["pcc_gz"] for r in rows if not np.isnan(r["pcc_gz"])]
         ge = [r["pcc_ge"] for r in rows if not np.isnan(r["pcc_ge"])]
+        gm = [r["pcc_gm"] for r in rows if not np.isnan(r["pcc_gm"])]
+        rz = [r["pcc_rz"] for r in rows if not np.isnan(r["pcc_rz"])]
         dl = [r["delta"] for r in rows if not np.isnan(r["delta"])]
         print(f"\n=== {name} LOEO ({len(rows)} held-out envs):")
         print(f"  PCC(Gz): {np.mean(gz):+.3f} +- {np.std(gz):.3f}  (n={len(gz)})")
         print(f"  PCC(G+E): {np.mean(ge):+.3f} +- {np.std(ge):.3f}  (n={len(ge)})")
+        print(f"  PCC(geno-mean GBLUP-lite): {np.mean(gm):+.3f} +- {np.std(gm):.3f}  (n={len(gm)})")
+        print(f"  PCC(random-z control): {np.mean(rz):+.3f} +- {np.std(rz):.3f}  (n={len(rz)})")
         print(f"  Delta = PCC(Gz)-PCC(G+E): {np.mean(dl):+.3f} +- {np.std(dl):.3f}  (n={len(dl)})")
         return dl
 
     summarize("wheat ESWYT", w_res)
     summarize("corn G2F", c_res)
     return 0
+
+
+def _apply_strata(items: list[dict], n_bins: int, target: int, device: str) -> list[dict]:
+    """Improvement #4: distance-stratified environment sampling.
+
+    Trains a quick EnvIndex encoder on all sampled environments, encodes each
+    env, computes dist(e) to k-NN, then samples `target` envs uniformly across
+    dist-quantile bins.
+    """
+    from envindex.sampling import encode_all, environment_distance, stratify_sample
+
+    env_ids = sorted(set(i["env_id"] for i in items))
+    # quick encoder for distance computation
+    from envindex.train import EnvIndexModule
+    geno2idx = {g: i for i, g in enumerate(sorted(set(i["geno"] for i in items)))}
+    module = EnvIndexModule(
+        n_stages=items[0]["x"].shape[0],
+        n_features=items[0]["x"].shape[1],
+        d_embed=16,
+        d_geno=16,
+        rank=2,
+        n_genotypes=len(geno2idx) + 1,
+    ).to(device)
+    # train briefly
+    from torch.utils.data import DataLoader
+    opt = torch.optim.AdamW(module.parameters(), lr=3e-3)
+    rng = np.random.default_rng(0)
+    for _ in range(5):
+        batch = rng.choice(items, size=min(256, len(items)), replace=False)
+        x = torch.as_tensor(np.stack([np.nan_to_num(b["x"]) for b in batch]), dtype=torch.float32).to(device)
+        st = torch.zeros(len(batch), 0, dtype=torch.float32, device=device)
+        idx = torch.as_tensor([geno2idx.get(b["geno"], len(geno2idx)) for b in batch], dtype=torch.long).to(device)
+        y = torch.as_tensor([b["y"] for b in batch], dtype=torch.float32).to(device)
+        y_hat, env_hat, _ = module(x, None, idx, st)
+        loss = torch.nn.functional.mse_loss(y_hat, y)
+        opt.zero_grad(); loss.backward(); opt.step()
+    z = encode_all(module, items, device)
+    dist = environment_distance(z)
+    chosen = stratify_sample(env_ids, dist, n_bins=n_bins, target_total=target, seed=0)
+    keep = set(chosen)
+    return [i for i in items if i["env_id"] in keep]
 
 
 if __name__ == "__main__":
