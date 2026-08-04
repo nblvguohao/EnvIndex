@@ -301,12 +301,16 @@ def run_loe(
     from concurrent.futures import ProcessPoolExecutor
     import multiprocessing as mp
 
+    # spawn (not fork): the parent has an initialized CUDA context; forking a
+    # subprocess that uses CUDA raises "Cannot re-initialize CUDA".
+    ctx = mp.get_context("spawn")
     params = (d_embed, d_geno, rank, epochs, batch_size, num_workers, seed)
-    counter = mp.Manager().Value("i", 0)
-    lock = mp.Manager().Lock()
+    counter = ctx.Manager().Value("i", 0)
+    lock = ctx.Manager().Lock()
     results = {}
     with ProcessPoolExecutor(
         max_workers=fold_workers,
+        mp_context=ctx,
         initializer=_init_worker,
         initargs=(items, params, counter, lock),
     ) as pool:
