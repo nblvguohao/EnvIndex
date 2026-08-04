@@ -473,6 +473,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--program", default=None, help="Substring filter on breeding program name")
     parser.add_argument("--trial", default=None, help="Substring filter on study/trial name")
     parser.add_argument("--out-dir", type=Path, default=Path("data/t3"), help="Output directory")
+    parser.add_argument("--tag", default="", help="Optional tag appended to catalog filename (trials_catalog_{tag}.parquet)")
     parser.add_argument("--token", default=None, help="BrAPI bearer token (or set T3_TOKEN)")
     parser.add_argument("--sleep", type=float, default=0.25, help="Seconds between paged requests")
     parser.add_argument("--retries", type=int, default=5,
@@ -507,7 +508,8 @@ def main(argv: list[str] | None = None) -> int:
     catalog, phenology_by_study = build_trials_catalog(
         client, program_filter=args.program, trial_filter=args.trial, workers=args.workers
     )
-    catalog_path = args.out_dir / "trials_catalog.parquet"
+    catalog_name = f"trials_catalog_{args.tag}.parquet" if args.tag else "trials_catalog.parquet"
+    catalog_path = args.out_dir / catalog_name
     catalog.to_parquet(catalog_path, index=False)
     print(f"[t3_brapi_export] catalog: {len(catalog)} trials -> {catalog_path}")
     if len(catalog) == 0:
