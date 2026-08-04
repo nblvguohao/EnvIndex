@@ -13,7 +13,7 @@
 |------|--------|--------|----------|---------|
 | **玉米** | G2F 2014–2023（Paper 1 已有） | **272** | 播期 + 站点天气 | ✅ |
 | **小麦（T3 美系）** | SDSU 春麦 + Five State + Kentucky + Michigan State | **188**（含物候） | Heading/Anthesis/Maturity 日期 | ✅ |
-| **小麦（国际 CIMMYT）** | IWIN 清洗数据集（Harvard Dataverse） | 数百（6 nursery × 1979–2020） | 抽穗/开花常规记录；天气数据已公开 | ✅ 路径确认 |
+| **小麦（国际 CIMMYT）** | IWIN 清洗数据集（Harvard Dataverse） | **2,965**（5 nursery × 1979–2019） | sow/head/matu 100% + 阶段气候特征 | ✅ 已下载 |
 | **大豆** | SoyNAM | **18**（100% 开花日期）+ 3（R1/GDD_R1） | flower/R1/GDD_R1 全覆盖 | 🟡 环境数不足，作补充臂 |
 
 **跨作物合计**：272 + 188 = **460 环境**（≥400 门槛已过）✅
@@ -73,12 +73,14 @@
 - 结论：SoyNAM 物候记录完整可用（TODO-4 结论实证确认）
 - **局限**：18 环境 < G1 的 ≥50 → 按协议降级为"家系结构遗传背景"补充臂，**不计入 H2 的 ≥3 作物**
 
-## 5. 小麦国际：CIMMYT IWIN 路径确认
+## 5. 小麦国际：CIMMYT IWIN 数据下载（已完成）
 
-- **首选**：[Harvard Dataverse 清洗版 IWIN 数据 v2](https://doi.org/10.7910/DVN/3GAKGY)（Xiong et al.）——1979–2020，6 nursery（ESWYT/SAWYT/HTWYT/IDYN/IWWYT_IRR/IWWYT_SA），干净格式化，可直接下载
-- **天气**：[~785 IWIN 地点的逐日气象数据](https://hdl.handle.net/11529/10548626) 已公开——直接解决 CIMMYT 国际站点天气重提取问题（NASA POWER 在热带偏差大的风险随之降低）
-- **备选**：CIMMYT Dataverse（单试验，如 36th ESWYT）、CIMMYT 埃塞俄比亚门户（最新 42nd ESWYT，CKAN API）
-- **结论**：CIMMYT 路径**确认可达**，可作为小麦国际臂或 T3 春麦臂的补充
+- **下载**：[Harvard Dataverse 清洗版 IWIN v2](https://doi.org/10.7910/DVN/3GAKGY)（Xiong et al.）5 个 nursery 全部下载（24.6 MB），脚本 `scripts/cimmyt_download.py`
+- **规模**：**2,965 环境**（ESWYT 1,495 + IDYN 987 + IWWYT_IRR 204 + HTWYT 160 + IWWYT_SA 119），1979–2019，**100% 抽穗期覆盖**
+- **结构**：`sow/head/matu` 日期 + 阶段感知气候特征（veg/rep/gfi 三阶段的 tavg/gdd30/降水/辐射/VPD/风速）+ 产量 —— **R1 臂特征的现成实现**
+- **天气**：[~785 IWIN 地点逐日气象](https://hdl.handle.net/11529/10548626) 已公开（坐标解析待办）
+- **对 H2 的价值**：T3（美国同源）与 CIMMYT（国际异源）提供天然距离分层——正好刻画 Δ-dist 曲线的高距离端
+- **待办**：地点坐标解析、气候口径归一化（gdd30 基温）、环境 ID 统一、LOEO 规模成本评估（2,965 环境 ≈ T3 的 15 倍）
 
 ## 6. 玉米：G2F（Paper 1 已有）
 
