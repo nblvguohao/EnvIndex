@@ -100,6 +100,8 @@ class BrApiClient:
     base_url: str
     token: str | None = None
     sleep_seconds: float = 0.25
+    max_retries: int = 5
+    retry_backoff: float = 2.0
     _getter: Callable[[str, dict | None], Any] | None = None
 
     def __post_init__(self) -> None:
@@ -118,6 +120,27 @@ class BrApiClient:
         with urllib.request.urlopen(request, timeout=60) as response:
             return json.loads(response.read().decode("utf-8"))
 
+    def _call_with_retry(self, url: str, params: dict | None = None) -> Any:
+        """Call self._call with exponential-backoff retry on transient errors.
+
+        Retries ConnectionReset / timeouts / truncated JSON and HTTP 429/5xx;
+        fatal 401/403 and other 4xx are raised immediately.
+        """
+        last_error: Exception | None = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                return self._call(url, params)
+            except (urllib.error.URLError, ConnectionResetError, TimeoutError,
+                    urllib.error.HTTPError, json.JSONDecodeError) as exc:
+                if isinstance(exc, urllib.error.HTTPError) and exc.code not in (429, 500, 502, 503, 504):
+                    raise
+                last_error = exc
+                wait = self.retry_backoff * (2 ** (attempt - 1))
+                print(f"[t3_brapi_export] retry {attempt}/{self.max_retries} after "
+                      f"{type(exc).__name__} ({wait:.1f}s)", file=sys.stderr)
+                time.sleep(wait)
+        raise RuntimeError(f"Request failed after {self.max_retries} retries: {last_error}") from last_error
+
     def _paginated(self, path: str, params: dict | None = None) -> list[dict]:
         """Walk all pages of a BrAPI list endpoint."""
         out: list[dict] = []
@@ -126,7 +149,7 @@ class BrApiClient:
         page = 0
         while True:
             params["page"] = page
-            payload = self._call(self.base_url + path.lstrip("/"), params)
+            payload = self._call_with_retry(self.base_url + path.lstrip("/"), params)
             result = payload.get("result", {})
             data = result.get("data", [])
             out.extend(data if isinstance(data, list) else [])
@@ -353,6 +376,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=Path("data/t3"), help="Output directory")
     parser.add_argument("--token", default=None, help="BrAPI bearer token (or set T3_TOKEN)")
     parser.add_argument("--sleep", type=float, default=0.25, help="Seconds between paged requests")
+    parser.add_argument("--retries", type=int, default=5,
+                        help="Max attempts per request on transient failures (default 5)")
     return parser.parse_args(argv)
 
 
@@ -372,7 +397,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     base_url = args.base_url or DEFAULT_BASE_URLS[args.crop]
     token = _resolve_token(args.token)
-    client = BrApiClient(base_url=base_url, token=token, sleep_seconds=args.sleep)
+    client = BrApiClient(base_url=base_url, token=token, sleep_seconds=args.sleep,
+                         max_retries=args.retries)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[t3_brapi_export] base_url={base_url} mode={args.mode} crop={args.crop}")

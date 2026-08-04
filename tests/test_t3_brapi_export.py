@@ -171,6 +171,37 @@ def test_export_phenology_observations_shape():
     assert obs.iloc[0]["value"] == "58"
 
 
+def test_http_get_retries_on_transient_errors():
+    """Retries ConnectionReset / 502, but not fatal 401."""
+    attempts = {"n": 0}
+
+    def flaky_get(url: str, params: dict | None = None) -> dict:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise ConnectionResetError("forcefully closed")
+        return {"result": {"data": [], "pagination": {}}}
+
+    client = t3.BrApiClient(base_url="https://example.test/", sleep_seconds=0,
+                            max_retries=5, _getter=flaky_get)
+    assert client.list_programs() == []  # empty data after successful retry
+    assert attempts["n"] == 3  # two failures then success
+
+
+def test_http_get_does_not_retry_on_401():
+    attempts = {"n": 0}
+
+    def auth_fail_get(url: str, params: dict | None = None) -> dict:
+        attempts["n"] += 1
+        raise urllib.error.HTTPError(url, 401, "Unauthorized", {}, None)
+
+    client = t3.BrApiClient(base_url="https://example.test/", sleep_seconds=0,
+                            max_retries=5, _getter=auth_fail_get)
+    import urllib.error
+    with pytest.raises(urllib.error.HTTPError):
+        client.list_programs()
+    assert attempts["n"] == 1
+
+
 def test_no_trials_matched_returns_empty_catalog():
     routes = {
         "programs": {"result": {"data": [_program("Nebraska", "P1")], "pagination": {}}},
