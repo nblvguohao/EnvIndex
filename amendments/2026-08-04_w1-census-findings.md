@@ -56,13 +56,28 @@
 
 **判定**：小麦臂 G1 条件性满足。**卡点**：(a) 大豆环境数不足（SoyNAM ≤18，需补 CIMMYT 或大麦臂）；(b) 播期/坐标缺失的退化方案需在 W3 落地。
 
+## 4.5 多项目扩充（4 项目合并结果）
+
+| 项目 | 试验 | 物候 | 环境(位置×年份) | 物候性状 |
+|------|------|------|------------------|----------|
+| SDSU 春麦 | 255 | 248 | 83 | Heading time |
+| Five State | 220 | 164 | 90 | Heading/Anthesis/Maturity |
+| Kentucky | 121 | 45 | 6 | Heading time |
+| Michigan State | 226 | 27 | 13 | Heading/Anthesis/Maturity |
+| **合计** | **822** | **484** | **188** | — |
+
+- 合并 catalog：`data/t3/trials_catalog_combined.parquet`（含 `catalog_tag` 列）。
+- 试验类型：Advanced Yield Trial 336 / Preliminary Yield Trial 248 / phenotyping_trial 196。
+- 播期覆盖：物候试验 181/484（37%）——约 2/3 需抽穗期锚定季节窗口。
+- 物候性状跨项目一致性：Heading time 四项目全有；Anthesis/Maturity 在 MSU 与 Five State 有。
+
 ## 5. 下一步
 
-1. 跑 Michigan State / Five State / Kentucky 普查，扩充环境集并验证多项目一致性（后台进行中）。
-2. 设计并实现"抽穗期锚定的季节窗口"（W3 管道）。
-3. NOAA 站点 ID → 坐标解析脚本。
-4. 大豆 SoyNAM 普查（R1/GDD_R1 确认）。
-5. CIMMYT 数据路径确认（G1 缺口）。
+1. 设计并实现"抽穗期锚定的季节窗口"（W3 管道）——解决 2/3 物候试验缺播期。
+2. NOAA 站点 ID → 坐标解析脚本（天气重提取前提）。
+3. 大豆 SoyNAM 普查（R1/GDD_R1 确认）。
+4. CIMMYT 数据路径确认（G1 缺口，若大豆臂不足）。
+5. 冬小麦臂：Kentucky(6)/MSU(13) 环境偏少，可从 Hard Winter Wheat Regional Nursery(40) 补充。
 
 ## 6. 工具状态
 
