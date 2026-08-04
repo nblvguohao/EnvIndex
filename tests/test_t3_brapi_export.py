@@ -171,6 +171,51 @@ def test_export_phenology_observations_shape():
     assert obs.iloc[0]["value"] == "58"
 
 
+def test_base_url_normalizes_to_brapi_v2():
+    """Root URLs get /brapi/v2/ appended (bug: was hitting web UI HTML)."""
+    captured: dict = {}
+
+    def capture_get(url: str, params: dict | None = None) -> dict:
+        captured["url"] = url
+        return {"result": {"data": [], "pagination": {}}}
+
+    client = t3.BrApiClient(base_url="https://wheat.triticeaetoolbox.org/", _getter=capture_get)
+    client.list_programs()
+    assert captured["url"].startswith("https://wheat.triticeaetoolbox.org/brapi/v2/programs")
+
+    # Passing a full base already containing brapi/v2 is not double-appended.
+    client2 = t3.BrApiClient(base_url="https://wheat.triticeaetoolbox.org/brapi/v2/", _getter=capture_get)
+    client2.list_programs()
+    assert captured["url"].startswith("https://wheat.triticeaetoolbox.org/brapi/v2/programs")
+
+
+def test_census_degrades_gracefully_on_study_variable_failure():
+    """A 500 on one study's variable fetch must not abort the census."""
+    import urllib.error
+
+    routes = {
+        "programs": {"result": {"data": [_program("Nebraska", "P1")], "pagination": {}}},
+        "studies": {"result": {"data": [_study("S1", "S1"), _study("S2", "S2")], "pagination": {}}},
+        "observationvariables": {"result": {"data": [], "pagination": {}}},
+    }
+
+    def flaky_get(url: str, params: dict | None = None) -> dict:
+        # S1's variable fetch raises 500; S2 and everything else succeed.
+        if "studies/S1/observationvariables" in url:
+            raise urllib.error.HTTPError(url, 500, "Internal Server Error", {}, None)
+        path = url.split("/")[-1].split("?")[0]
+        return routes.get(path, routes["observationvariables"])
+
+    client = t3.BrApiClient(base_url="https://example.test/", sleep_seconds=0,
+                            max_retries=1, retry_backoff=0, _getter=flaky_get)
+    catalog, _ = t3.build_trials_catalog(client)
+    assert len(catalog) == 2  # census continues past the failing study
+    s1 = catalog[catalog["study_db_id"] == "S1"].iloc[0]
+    s2 = catalog[catalog["study_db_id"] == "S2"].iloc[0]
+    assert s1["variables_error"] != ""
+    assert s2["variables_error"] == ""
+
+
 def test_http_get_retries_on_transient_errors():
     """Retries ConnectionReset / 502, but not fatal 401."""
     attempts = {"n": 0}

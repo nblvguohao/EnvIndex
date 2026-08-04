@@ -107,6 +107,10 @@ class BrApiClient:
     def __post_init__(self) -> None:
         if not self.base_url.endswith("/"):
             self.base_url += "/"
+        # BrAPI v2 paths hang off <root>/brapi/v2/.  Accept either a root URL
+        # (https://host/) or a full base (https://host/brapi/v2/).
+        if "brapi/" not in self.base_url:
+            self.base_url += "brapi/v2/"
         self._call = self._getter or self._http_get
 
     # -- low-level ---------------------------------------------------------
@@ -153,7 +157,9 @@ class BrApiClient:
             result = payload.get("result", {})
             data = result.get("data", [])
             out.extend(data if isinstance(data, list) else [])
-            pagination = result.get("pagination", {})
+            # BrAPI v2 servers place pagination under metadata.pagination;
+            # some implementations put it under result.pagination. Probe both.
+            pagination = payload.get("metadata", {}).get("pagination", {}) or result.get("pagination", {})
             total_pages = pagination.get("totalPages")
             if total_pages is None:
                 # Fall back to totalCount-based inference.
@@ -285,17 +291,17 @@ def _study_env_fields(study: dict) -> dict:
 
 # ---------------------------------------------------------------- exports
 
-def build_trials_catalog(
-    client: BrApiClient, program_filter: str | None = None, trial_filter: str | None = None
-) -> tuple[pd.DataFrame, list[dict]]:
-    """Census: enumerate trials, flag phenology-variable availability.
+def _collect_studies(
+    client: BrApiClient, program_filter: str | None, trial_filter: str | None
+) -> list[tuple[dict, dict]]:
+    """Enumerate programs and their studies (all pages).
 
-    Returns (catalog DataFrame, per-trial phenology variable lists).
+    Returns a flat list of (program, study) tuples.  Study enumeration is
+    sequential (programs are few); the per-study variable fetch happens later
+    in parallel.
     """
     programs = client.list_programs()
-    catalog_rows: list[dict] = []
-    phenology_by_study: dict[str, list[dict]] = {}
-
+    records: list[tuple[dict, dict]] = []
     for program in programs:
         pname = str(_get(program, "programName", default=""))
         if program_filter and program_filter.lower() not in pname.lower():
@@ -306,23 +312,84 @@ def build_trials_catalog(
             env = _study_env_fields(study)
             if trial_filter and trial_filter.lower() not in env["study_name"].lower():
                 continue
-            # Pull the trait list for this trial and keep the phenology subset.
-            variables = client.study_observation_variables(env["study_db_id"])
+            records.append((program, study))
+    return records
+
+
+def _fetch_study_variables(client: BrApiClient, study_db_id: str, study_name: str) -> tuple[str, list[dict], str]:
+    """Fetch a study's observation variables; returns (study_id, variables, error)."""
+    try:
+        variables = client.study_observation_variables(study_db_id)
+        return study_db_id, variables, ""
+    except Exception as exc:  # noqa: BLE001 - census is best-effort
+        error = f"{type(exc).__name__}: {exc}"
+        print(f"[t3_brapi_export] WARN study {study_db_id} ({study_name}) "
+              f"variable fetch failed: {error}", file=sys.stderr)
+        return study_db_id, [], error
+
+
+def build_trials_catalog(
+    client: BrApiClient,
+    program_filter: str | None = None,
+    trial_filter: str | None = None,
+    workers: int = 6,
+) -> tuple[pd.DataFrame, dict[str, list[dict]]]:
+    """Census: enumerate trials, flag phenology-variable availability.
+
+    Study-variable fetches run in a thread pool (`workers`) because the
+    per-study observationvariables call is the dominant cost and the T3
+    connection is flaky.  A single study failing server-side is recorded in
+    `variables_error` and does not abort the census.
+
+    Returns (catalog DataFrame, per-trial phenology variable lists).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    records = _collect_studies(client, program_filter, trial_filter)
+    total = len(records)
+    print(f"[t3_brapi_export] collected {total} studies across filtered programs; "
+          f"fetching variables with {workers} workers...")
+
+    catalog_rows: list[dict] = []
+    phenology_by_study: dict[str, list[dict]] = {}
+    done = 0
+    env_by_study: dict[str, dict] = {}
+    program_by_study: dict[str, dict] = {}
+    for program, study in records:
+        env = _study_env_fields(study)
+        env_by_study[env["study_db_id"]] = env
+        program_by_study[env["study_db_id"]] = program
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_fetch_study_variables, client, sid, env["study_name"]): sid
+            for sid, env in env_by_study.items()
+        }
+        for future in as_completed(futures):
+            study_db_id, variables, error = future.result()
             pheno = [v for v in variables if is_phenology_trait(v)]
-            phenology_by_study[env["study_db_id"]] = [
+            phenology_by_study[study_db_id] = [
                 {"variable_db_id": variable_id(v), "name": variable_name(v), "unit": variable_unit(v)}
                 for v in pheno
             ]
+            env = env_by_study[study_db_id]
+            program = program_by_study[study_db_id]
             catalog_rows.append(
                 {
                     **env,
+                    "program_name": str(_get(program, "programName", default="")),
                     "crop": "wheat",
                     "n_variables_total": len(variables),
                     "n_phenology_variables": len(pheno),
                     "phenology_traits": "; ".join(sorted({variable_name(v) for v in pheno})),
                     "has_phenology": len(pheno) > 0,
+                    "variables_error": error,
                 }
             )
+            done += 1
+            if done % 100 == 0 or done == total:
+                print(f"[t3_brapi_export] progress {done}/{total} studies "
+                      f"({len(phenology_by_study)} cached)", flush=True)
 
     catalog = pd.DataFrame(catalog_rows)
     return catalog, phenology_by_study
@@ -343,7 +410,14 @@ def export_phenology_observations(
         study_db_id = str(env["study_db_id"])
         pheno_vars = phenology_by_study.get(study_db_id, [])
         for var in pheno_vars:
-            for obs in client.study_observations(study_db_id, var["variable_db_id"]):
+            try:
+                observations = client.study_observations(study_db_id, var["variable_db_id"])
+            except Exception as exc:  # noqa: BLE001 - best-effort export
+                print(f"[t3_brapi_export] WARN study {study_db_id} trait "
+                      f"{var['name']} observations failed: {type(exc).__name__}: {exc}",
+                      file=sys.stderr)
+                continue
+            for obs in observations:
                 rows.append(
                     {
                         "study_db_id": study_db_id,
@@ -378,6 +452,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sleep", type=float, default=0.25, help="Seconds between paged requests")
     parser.add_argument("--retries", type=int, default=5,
                         help="Max attempts per request on transient failures (default 5)")
+    parser.add_argument("--workers", type=int, default=6,
+                        help="Parallel study-variable fetch workers (default 6)")
     return parser.parse_args(argv)
 
 
@@ -404,7 +480,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[t3_brapi_export] base_url={base_url} mode={args.mode} crop={args.crop}")
 
     catalog, phenology_by_study = build_trials_catalog(
-        client, program_filter=args.program, trial_filter=args.trial
+        client, program_filter=args.program, trial_filter=args.trial, workers=args.workers
     )
     catalog_path = args.out_dir / "trials_catalog.parquet"
     catalog.to_parquet(catalog_path, index=False)
