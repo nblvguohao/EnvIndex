@@ -365,10 +365,12 @@ amendments/YYYY-MM-DD_<简短描述>.md
 
 以下项目在协议冻结时尚未完成，须在实验执行前解决。完成时以 dated amendment 记录结果。
 
-- [ ] **TODO-1**：PR #1 完成并推送到可验证仓库（多作物改造）
-- [ ] **TODO-2**：`63_audit_weather_alignment.py` 创建并测试
+- [x] **TODO-1**：PR #1 完成并推送到可验证仓库（多作物改造）—— 代码部分完成于 2026-08-04（见 amendments/2026-08-04_w0-multicrop-and-audit-script.md）；推送待办见备注
+- [x] **TODO-2**：`63_audit_weather_alignment.py` 创建并测试 —— 完成于 2026-08-04
 - [ ] **TODO-3**：小麦/大豆阶段窗口文献确认（含春化/GDD 基温引用）
 - [ ] **TODO-4**：T3 物候记录可用性确认（G1 通过条件）
+
+**备注**：TODO-1 的代码改造提交于 `G:\cc\nc` 仓库 `bbb7e9c`（10 文件，110 测试通过）。该仓库当前有大量无关的未提交工作区状态，尚未推送 remote；是否推送及以何种方式推送由仓库所有者决定。EnvIndex 仓库本身（本文档）待 TODO-3/TODO-4 完成后单独提交。
 
 ---
 
@@ -377,6 +379,7 @@ amendments/YYYY-MM-DD_<简短描述>.md
 | 日期 | 版本 | 变更 | Amendment 文件 |
 |------|------|------|----------------|
 | 2026-08-04 | v1.0 | 协议冻结。冻结前已融入 6 透镜敌对评审反馈（3 致命 + 7 重要修复，详见设计文档 v1.1 修订日志） | — |
+| 2026-08-04 | — | 完成 TODO-1 代码部分（多作物改造，`nc` 提交 `bbb7e9c`）+ TODO-2（`63_audit_weather_alignment.py`）。附录 B 勾选更新 | amendments/2026-08-04_w0-multicrop-and-audit-script.md |
 
 ---
 
