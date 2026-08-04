@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Data (large files managed separately)
+data/
+*.parquet
+*.csv
+*.h5
+*.pkl
+*.joblib
+
+# Models & checkpoints
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Outputs
+outputs/
+results/
+figures/
+logs/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+venv/
+.venv/
