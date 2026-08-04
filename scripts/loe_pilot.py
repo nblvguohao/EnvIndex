@@ -53,10 +53,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--strata", type=int, default=0,
                         help="Distance-stratified env sampling (improvement #4): number of bins (>0 enables)")
     parser.add_argument("--target", type=int, default=30, help="Target envs after stratified sampling")
-    parser.add_argument("--batch-size", type=int, default=128,
-                        help="Training batch size (raise to 512-1024 on A100 for GPU efficiency)")
+    parser.add_argument("--batch-size", type=int, default=1024,
+                        help="Training batch size (1024 on A100 for GPU efficiency)")
     parser.add_argument("--num-workers", type=int, default=0,
                         help="DataLoader workers (0 = main process; >0 avoids data loading stalls)")
+    parser.add_argument("--fold-workers", type=int, default=1,
+                        help="Parallel LOEO fold workers (>1 = ProcessPool, each pinned to a GPU)")
+    parser.add_argument("--n-gpus", type=int, default=1, help="GPUs to round-robin fold workers across")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args(argv)
 
@@ -120,137 +123,196 @@ def _pcc(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.corrcoef(a, b)[0, 1])
 
 
-def run_loe(
+_SHARED: dict = {}
+
+
+def _run_one_fold(
     items: list[dict],
-    n_genotypes: int,
+    held: str,
     d_embed: int,
     d_geno: int,
     rank: int,
     epochs: int,
     device: str,
     seed: int,
-    batch_size: int = 128,
-    num_workers: int = 0,
-) -> dict:
-    """Run leave-one-environment-out; returns per-env {pcc_gz, pcc_ge, delta}."""
-    envs = sorted(set(i["env_id"] for i in items))
+    batch_size: int,
+    num_workers: int,
+) -> tuple[str, dict]:
+    """Train on all-but-held environment, predict held-out, return metrics."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    train_items = [i for i in items if i["env_id"] != held]
+    held_items = [i for i in items if i["env_id"] == held]
+    if len(train_items) == 0 or len(held_items) < 3:
+        return held, {}
+
     geno2idx = {g: i for i, g in enumerate(sorted(set(i["geno"] for i in items)))}
-    # fallback index for genotypes unseen in a given train split
     UNK = len(geno2idx)
-    rng = np.random.default_rng(seed)
 
+    # feature normalization (train only)
+    xs = np.stack([i["x"] for i in train_items])
+    x_mean = np.nanmean(xs, axis=(0, 1), keepdims=False)
+    x_std = np.nanstd(xs, axis=(0, 1), keepdims=False) + 1e-6
+
+    train_env_mean = {}
+    for i in train_items:
+        train_env_mean.setdefault(i["env_id"], []).append(i["y"])
+    train_env_mean = {e: float(np.mean(v)) for e, v in train_env_mean.items()}
+    global_mean = float(np.mean([i["y"] for i in train_items]))
+    geno_train_mean = {}
+    for i in train_items:
+        geno_train_mean.setdefault(i["geno"], []).append(i["y"])
+    geno_train_mean = {g: float(np.mean(v)) for g, v in geno_train_mean.items()}
+
+    def build_dataset(source):
+        ds_items = []
+        for i in source:
+            x = (np.nan_to_num(i["x"]) - x_mean) / x_std
+            gidx = geno2idx.get(i["geno"], UNK)
+            ds_items.append(
+                {
+                    "x": x,
+                    "static": None,
+                    "g_emb": None,  # learnable via geno_idx (improvement #1)
+                    "geno_idx": gidx,
+                    "geno": i["geno"],
+                    "y": i["y"],
+                    "env_id": i["env_id"],
+                    "env_label": i["env_label"],
+                    "env_mean": train_env_mean.get(i["env_id"], global_mean),
+                }
+            )
+        return ds_items
+
+    train_ds = EnvYieldDataset(build_dataset(train_items), {i["env_id"]: train_env_mean.get(i["env_id"], global_mean) for i in train_items})
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        collate_fn=collate,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=device.startswith("cuda"),
+    )
+
+    module = EnvIndexModule(
+        n_stages=items[0]["x"].shape[0],
+        n_features=items[0]["x"].shape[1],
+        d_embed=d_embed,
+        d_geno=d_geno,
+        rank=rank,
+        n_genotypes=len(geno2idx) + 1,
+    ).to(device)
+    opt = torch.optim.AdamW(module.parameters(), lr=3e-3, weight_decay=1e-4)
+
+    for _ in range(epochs):
+        module.train()
+        for batch in train_loader:
+            x = batch["x"].to(device)
+            static = batch["static"].to(device)
+            g = batch["g_emb"].to(device) if batch["g_emb"] is not None else None
+            idx = batch["geno_idx"].to(device)
+            y = batch["y"].to(device)
+            y_hat, env_hat, z = module(x, g, idx, static)
+            loss = nn.functional.mse_loss(y_hat, y) + 0.5 * nn.functional.mse_loss(env_hat, batch["env_mean"].to(device))
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+    # predict held-out
+    module.eval()
+    hd = build_dataset(held_items)
+    ys, gz_pred, ge_pred, gm_pred, rz_pred = [], [], [], [], []
+    with torch.no_grad():
+        for it in hd:
+            x = torch.as_tensor(it["x"], dtype=torch.float32).unsqueeze(0).to(device)
+            st_raw = it["static"] if it["static"] is not None else []
+            st = torch.as_tensor(st_raw, dtype=torch.float32).unsqueeze(0).to(device)
+            idx = torch.as_tensor([it["geno_idx"]], dtype=torch.long).to(device)
+            y_hat, _, _ = module(x, None, idx, st)  # learnable geno embedding
+            gz_pred.append(float(y_hat.squeeze().cpu()))
+            ys.append(it["y"])
+            # G+E additive baseline: env mean + genotype deviation
+            gdev = geno_train_mean.get(it["geno"], global_mean) - global_mean
+            ge_pred.append(float(it["env_mean"] + gdev))
+            # genotype-mean baseline (GBLUP-G-lite)
+            gm_pred.append(geno_train_mean.get(it["geno"], global_mean))
+            # random-embedding negative control (protocol §5-12): G+E with random z
+            rz = torch.randn(d_embed, device=device)
+            rz_y = module.main_head.bias + module.main_head.env_main(rz.unsqueeze(0)).squeeze(0) \
+                + (module.geno_embedding(idx) @ module.main_head.U * (rz.unsqueeze(0) @ module.main_head.V)).sum(-1).squeeze(0)
+            rz_pred.append(float(rz_y.squeeze().cpu()))
+    ys = np.array(ys)
+    pcc_gz = _pcc(ys, np.array(gz_pred))
+    pcc_ge = _pcc(ys, np.array(ge_pred))
+    pcc_gm = _pcc(ys, np.array(gm_pred))
+    pcc_rz = _pcc(ys, np.array(rz_pred))
+    return held, {
+        "pcc_gz": pcc_gz,
+        "pcc_ge": pcc_ge,
+        "pcc_gm": pcc_gm,
+        "pcc_rz": pcc_rz,
+        "delta": pcc_gz - pcc_ge,
+    }
+
+
+def _init_worker(items, params, counter, lock):
+    """ProcessPool worker init: pin a GPU (round-robin) and share data."""
+    import os
+
+    global _SHARED
+    with lock:
+        gpu = counter.value
+        counter.value += 1
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    _SHARED = {"items": items, "params": params}
+
+
+def _run_fold_worker(held):
+    global _SHARED
+    items = _SHARED["items"]
+    d_embed, d_geno, rank, epochs, batch_size, num_workers, seed = _SHARED["params"]
+    return _run_one_fold(items, held, d_embed, d_geno, rank, epochs, "cuda", seed, batch_size, num_workers)
+
+
+def run_loe(
+    items: list[dict],
+    d_embed: int,
+    d_geno: int,
+    rank: int,
+    epochs: int,
+    device: str,
+    seed: int,
+    batch_size: int = 1024,
+    num_workers: int = 0,
+    fold_workers: int = 1,
+    n_gpus: int = 1,
+) -> dict:
+    """Leave-one-environment-out.  `fold_workers > 1` runs folds in parallel
+    processes, each pinned to a GPU round-robin (improvement #4)."""
+    envs = sorted(set(i["env_id"] for i in items))
+    if fold_workers <= 1:
+        results = {}
+        for held in envs:
+            h, r = _run_one_fold(items, held, d_embed, d_geno, rank, epochs, device, seed, batch_size, num_workers)
+            if r:
+                results[h] = r
+        return results
+
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing as mp
+
+    params = (d_embed, d_geno, rank, epochs, batch_size, num_workers, seed)
+    counter = mp.Manager().Value("i", 0)
+    lock = mp.Manager().Lock()
     results = {}
-    for held in envs:
-        train_items = [i for i in items if i["env_id"] != held]
-        held_items = [i for i in items if i["env_id"] == held]
-        if len(train_items) == 0 or len(held_items) < 3:
-            continue
-
-        # feature normalization (train only)
-        xs = np.stack([i["x"] for i in train_items])
-        x_mean = np.nanmean(xs, axis=(0, 1), keepdims=False)
-        x_std = np.nanstd(xs, axis=(0, 1), keepdims=False) + 1e-6
-
-        train_env_mean = {}
-        for i in train_items:
-            train_env_mean.setdefault(i["env_id"], []).append(i["y"])
-        train_env_mean = {e: float(np.mean(v)) for e, v in train_env_mean.items()}
-        global_mean = float(np.mean([i["y"] for i in train_items]))
-        geno_train_mean = {}
-        for i in train_items:
-            geno_train_mean.setdefault(i["geno"], []).append(i["y"])
-        geno_train_mean = {g: float(np.mean(v)) for g, v in geno_train_mean.items()}
-
-        def build_dataset(source):
-            ds_items = []
-            for i in source:
-                x = (np.nan_to_num(i["x"]) - x_mean) / x_std
-                gidx = geno2idx.get(i["geno"], UNK)
-                ds_items.append(
-                    {
-                        "x": x,
-                        "static": None,
-                        "g_emb": None,  # learnable via geno_idx (improvement #1)
-                        "geno_idx": gidx,
-                        "geno": i["geno"],
-                        "y": i["y"],
-                        "env_id": i["env_id"],
-                        "env_label": i["env_label"],
-                        "env_mean": train_env_mean.get(i["env_id"], global_mean),
-                    }
-                )
-            return ds_items
-
-        train_ds = EnvYieldDataset(build_dataset(train_items), {i["env_id"]: train_env_mean.get(i["env_id"], global_mean) for i in train_items})
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=batch_size,
-            collate_fn=collate,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=device.startswith("cuda"),
-        )
-
-        module = EnvIndexModule(
-            n_stages=items[0]["x"].shape[0],
-            n_features=items[0]["x"].shape[1],
-            d_embed=d_embed,
-            d_geno=d_geno,
-            rank=rank,
-            n_genotypes=len(geno2idx) + 1,
-        ).to(device)
-        opt = torch.optim.AdamW(module.parameters(), lr=3e-3, weight_decay=1e-4)
-
-        for _ in range(epochs):
-            module.train()
-            for batch in train_loader:
-                x = batch["x"].to(device)
-                static = batch["static"].to(device)
-                g = batch["g_emb"].to(device) if batch["g_emb"] is not None else None
-                idx = batch["geno_idx"].to(device)
-                y = batch["y"].to(device)
-                y_hat, env_hat, z = module(x, g, idx, static)
-                loss = nn.functional.mse_loss(y_hat, y) + 0.5 * nn.functional.mse_loss(env_hat, batch["env_mean"].to(device))
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
-
-        # predict held-out
-        module.eval()
-        hd = build_dataset(held_items)
-        ys, gz_pred, ge_pred, gm_pred, rz_pred = [], [], [], [], []
-        with torch.no_grad():
-            for it in hd:
-                x = torch.as_tensor(it["x"], dtype=torch.float32).unsqueeze(0).to(device)
-                st_raw = it["static"] if it["static"] is not None else []
-                st = torch.as_tensor(st_raw, dtype=torch.float32).unsqueeze(0).to(device)
-                idx = torch.as_tensor([it["geno_idx"]], dtype=torch.long).to(device)
-                y_hat, _, _ = module(x, None, idx, st)  # learnable geno embedding
-                gz_pred.append(float(y_hat.squeeze().cpu()))
-                ys.append(it["y"])
-                # G+E additive baseline: env mean + genotype deviation
-                gdev = geno_train_mean.get(it["geno"], global_mean) - global_mean
-                ge_pred.append(float(it["env_mean"] + gdev))
-                # genotype-mean baseline (GBLUP-G-lite)
-                gm_pred.append(geno_train_mean.get(it["geno"], global_mean))
-                # random-embedding negative control (protocol §5-12): G+E with random z
-                rz = torch.randn(d_embed, device=device)
-                rz_y = module.main_head.bias + module.main_head.env_main(rz.unsqueeze(0)).squeeze(0) \
-                    + (module.geno_embedding(idx) @ module.main_head.U * (rz.unsqueeze(0) @ module.main_head.V)).sum(-1).squeeze(0)
-                rz_pred.append(float(rz_y.squeeze().cpu()))
-        ys = np.array(ys)
-        pcc_gz = _pcc(ys, np.array(gz_pred))
-        pcc_ge = _pcc(ys, np.array(ge_pred))
-        pcc_gm = _pcc(ys, np.array(gm_pred))
-        pcc_rz = _pcc(ys, np.array(rz_pred))
-        results[held] = {
-            "pcc_gz": pcc_gz,
-            "pcc_ge": pcc_ge,
-            "pcc_gm": pcc_gm,
-            "pcc_rz": pcc_rz,
-            "delta": pcc_gz - pcc_ge,
-        }
-
+    with ProcessPoolExecutor(
+        max_workers=fold_workers,
+        initializer=_init_worker,
+        initargs=(items, params, counter, lock),
+    ) as pool:
+        for held, r in pool.map(_run_fold_worker, envs):
+            if r:
+                results[held] = r
     return results
 
 
@@ -265,8 +327,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.strata > 0:
         w_items = _apply_strata(w_items, args.strata, args.target, args.device)
         print(f"[loe_pilot] wheat stratified -> {len(set(i['env_id'] for i in w_items))} envs")
-    w_res = run_loe(w_items, len(set(i["geno"] for i in w_items)), args.d_embed, args.d_geno, args.rank, args.epochs, args.device, args.seed,
-                    batch_size=args.batch_size, num_workers=args.num_workers)
+    w_res = run_loe(w_items, args.d_embed, args.d_geno, args.rank, args.epochs, args.device, args.seed,
+                    batch_size=args.batch_size, num_workers=args.num_workers,
+                    fold_workers=args.fold_workers, n_gpus=args.n_gpus)
 
     print("[loe_pilot] loading corn G2F ...")
     c_items, c_envs = load_corn(args.n_envs_corn, args.seed)
@@ -274,8 +337,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.strata > 0:
         c_items = _apply_strata(c_items, args.strata, args.target, args.device)
         print(f"[loe_pilot] corn stratified -> {len(set(i['env_id'] for i in c_items))} envs")
-    c_res = run_loe(c_items, len(set(i["geno"] for i in c_items)), args.d_embed, args.d_geno, args.rank, args.epochs, args.device, args.seed,
-                    batch_size=args.batch_size, num_workers=args.num_workers)
+    c_res = run_loe(c_items, args.d_embed, args.d_geno, args.rank, args.epochs, args.device, args.seed,
+                    batch_size=args.batch_size, num_workers=args.num_workers,
+                    fold_workers=args.fold_workers, n_gpus=args.n_gpus)
 
     def summarize(name, res):
         rows = list(res.values())
