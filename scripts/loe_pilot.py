@@ -391,20 +391,32 @@ def _apply_strata(items: list[dict], n_bins: int, target: int, device: str) -> l
         rank=2,
         n_genotypes=len(geno2idx) + 1,
     ).to(device)
+    # Normalize features (z-score) before the quick training — unnormalized
+    # IWIN climate features (gdd30 up to ~344) make the encoder loss NaN,
+    # which collapses embeddings and breaks stratification.
+    xs = np.stack([np.nan_to_num(i["x"]) for i in items])
+    x_mean = np.nanmean(xs, axis=(0, 1), keepdims=False)
+    x_std = np.nanstd(xs, axis=(0, 1), keepdims=False) + 1e-6
+
+    def norm(it):
+        return (np.nan_to_num(it["x"]) - x_mean) / x_std
+
     # train briefly
     from torch.utils.data import DataLoader
     opt = torch.optim.AdamW(module.parameters(), lr=3e-3)
     rng = np.random.default_rng(0)
     for _ in range(5):
         batch = rng.choice(items, size=min(256, len(items)), replace=False)
-        x = torch.as_tensor(np.stack([np.nan_to_num(b["x"]) for b in batch]), dtype=torch.float32).to(device)
+        x = torch.as_tensor(np.stack([norm(b) for b in batch]), dtype=torch.float32).to(device)
         st = torch.zeros(len(batch), 0, dtype=torch.float32, device=device)
         idx = torch.as_tensor([geno2idx.get(b["geno"], len(geno2idx)) for b in batch], dtype=torch.long).to(device)
         y = torch.as_tensor([b["y"] for b in batch], dtype=torch.float32).to(device)
         y_hat, env_hat, _ = module(x, None, idx, st)
         loss = torch.nn.functional.mse_loss(y_hat, y)
         opt.zero_grad(); loss.backward(); opt.step()
-    z = encode_all(module, items, device)
+    # encode with normalized features (items reference the raw x)
+    norm_items = [{**i, "x": norm(i)} for i in items]
+    z = encode_all(module, norm_items, device)
     dist = environment_distance(z)
     chosen = stratify_sample(env_ids, dist, n_bins=n_bins, target_total=target, seed=0)
     keep = set(chosen)
