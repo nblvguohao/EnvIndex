@@ -188,7 +188,16 @@ class BrApiClient:
         return self._paginated("locations")
 
     def study_observation_variables(self, study_db_id: str) -> list[dict]:
-        return self._paginated(f"studies/{urllib.parse.quote(study_db_id)}/observationvariables")
+        """Traits measured in a study.
+
+        Prefer `/variables?studyDbId=` — the per-study
+        `/studies/{id}/observationvariables` endpoint returns HTTP 500 on the
+        T3 production server for many studies.
+        """
+        try:
+            return self._paginated("variables", {"studyDbId": study_db_id})
+        except Exception:
+            return self._paginated(f"studies/{urllib.parse.quote(study_db_id)}/observationvariables")
 
     def study_observations(
         self, study_db_id: str, variable_db_id: str | None = None
@@ -225,7 +234,9 @@ def variable_id(var: dict) -> str:
 
 
 def variable_name(var: dict) -> str:
-    return str(_get(var, "observationVariableName", "traitName", "name", default=""))
+    name = str(_get(var, "observationVariableName", "traitName", "name", default=""))
+    # T3 names carry a crop-ontology suffix: "Anthesis time - Julian date (JD)|CO_321:0501001"
+    return name.split("|")[0].strip()
 
 
 def variable_unit(var: dict) -> str:
@@ -238,54 +249,56 @@ def variable_unit(var: dict) -> str:
 def _study_env_fields(study: dict) -> dict:
     """Extract environment-candidate fields from a BrAPI study object.
 
+    T3's /studies list returns minimal objects: seasons is a list of year
+    strings, locationName/locationDbId/startDate/endDate sit at the top level,
+    and programName is nested under additionalInfo.  We parse that structure
+    with fallbacks for spec-conformant servers.
+
     Returns keys: program_name, trial_name, study_name, study_db_id, year,
     location_name, location_db_id, planting_date, harvest_date.
     """
-    location = _get(study, "location", default={}) or {}
-    if not isinstance(location, dict):
-        location = {}
     seasons = _get(study, "seasons", default=[]) or []
     year = None
     if seasons:
-        year = _get(seasons[0], "year", default=None) if isinstance(seasons[0], dict) else None
-    # planting date may be nested in additionalInfo / environmentParameters
-    planting = harvest = None
+        first = seasons[0]
+        year = first.get("year", first) if isinstance(first, dict) else first
+
     additional = _get(study, "additionalInfo", default={}) or {}
-    if isinstance(additional, dict):
-        for key in PLANTING_DATE_KEYS:
-            if key in additional:
-                planting = additional[key]
-                break
-        for key in HARVEST_DATE_KEYS:
-            if key in additional:
-                harvest = additional[key]
-                break
-    env_params = _get(study, "environmentParameters", default=[]) or []
-    if isinstance(env_params, list):
-        for param in env_params:
-            if not isinstance(param, dict):
-                continue
-            pname = str(param.get("parameterName", "")).lower()
-            for key in PLANTING_DATE_KEYS:
-                if key.lower() in pname:
-                    planting = param.get("value")
-                    break
-            for key in HARVEST_DATE_KEYS:
-                if key.lower() in pname:
-                    harvest = param.get("value")
-                    break
+    if not isinstance(additional, dict):
+        additional = {}
+
+    start_date = _get(study, "startDate", default=None)
+    end_date = _get(study, "endDate", default=None)
+    if not start_date:
+        start_date = additional.get("plantingDate")
+    if not end_date:
+        end_date = additional.get("harvestDate")
+
+    study_type = _get(study, "studyType",
+                      default=_get(study, "studyTypeName", default=""))
+    if isinstance(study_type, dict):
+        study_type = study_type.get("name", "")
+
+    # T3 puts locationName/locationDbId at the top level; spec-conformant
+    # servers nest them under a location dict.  Support both.
+    location = _get(study, "location", default={}) or {}
+    if not isinstance(location, dict):
+        location = {}
 
     return {
-        "program_name": _get(study, "programName", default=""),
+        "program_name": _get(study, "programName",
+                             default=additional.get("programName", "")),
         "trial_name": _get(study, "trialName", default=""),
         "study_name": _get(study, "studyName", default=""),
         "study_db_id": _get(study, "studyDbId", default=""),
-        "study_type": _get(study, "studyTypeName", default=""),
+        "study_type": str(study_type),
         "year": year,
-        "location_name": _get(location, "locationName", _get(study, "locationName", default="")),
-        "location_db_id": _get(location, "locationDbId", _get(study, "locationDbId", default="")),
-        "planting_date": planting,
-        "harvest_date": harvest,
+        "location_name": _get(study, "locationName",
+                              default=location.get("locationName", "")),
+        "location_db_id": _get(study, "locationDbId",
+                               default=location.get("locationDbId", "")),
+        "planting_date": start_date,
+        "harvest_date": end_date,
     }
 
 

@@ -123,11 +123,44 @@ def test_study_env_fields_parsing():
     assert env["study_name"] == "Spring01"
 
 
+def test_study_env_fields_t3_real_structure():
+    """Parses T3's actual /studies shape (seasons as string list, top-level
+    locationName/startDate, programName nested in additionalInfo)."""
+    raw = {
+        "studyName": "CSR-Val_2015_Mead",
+        "trialName": "CSR Validation",
+        "studyDbId": "5710",
+        "seasons": ["2015"],
+        "locationName": "Ithaca, NE",
+        "locationDbId": "117",
+        "startDate": "2014-10-06T00:00:00Z",
+        "endDate": "2015-07-18T00:00:00Z",
+        "studyType": "phenotyping_trial",
+        "additionalInfo": {"programName": "University of Nebraska", "programDbId": "349"},
+    }
+    env = t3._study_env_fields(raw)
+    assert env["year"] == "2015"
+    assert env["location_name"] == "Ithaca, NE"
+    assert env["location_db_id"] == "117"
+    assert env["planting_date"] == "2014-10-06T00:00:00Z"
+    assert env["harvest_date"] == "2015-07-18T00:00:00Z"
+    assert env["program_name"] == "University of Nebraska"
+    assert env["study_type"] == "phenotyping_trial"
+
+
+def test_is_phenology_trait_t3_ontology_names():
+    """T3 variable names carry a |CO_321:... ontology suffix; detection and
+    display must still work, and the suffix is stripped."""
+    var = _pheno_var("Anthesis time - Julian date (JD)|CO_321:0501001", "v1", unit="JD")
+    assert t3.is_phenology_trait(var)
+    assert t3.variable_name(var) == "Anthesis time - Julian date (JD)"
+
+
 def test_census_flags_phenology_and_filters_program():
     routes = {
         "programs": {"result": {"data": [_program("University of Nebraska", "P1"), _program("Other", "P2")], "pagination": {}}},
         "studies": {"result": {"data": [_study("Spring Trial", "S1")], "pagination": {}}},
-        "observationvariables": {
+        "variables": {
             "result": {
                 "data": [
                     _pheno_var("Days to heading", "VH"),
@@ -151,7 +184,7 @@ def test_export_phenology_observations_shape():
     routes = {
         "programs": {"result": {"data": [_program("Nebraska", "P1")], "pagination": {}}},
         "studies": {"result": {"data": [_study("Spring Trial", "S1")], "pagination": {}}},
-        "observationvariables": {"result": {"data": [_pheno_var("Days to heading", "VH")], "pagination": {}}},
+        "variables": {"result": {"data": [_pheno_var("Days to heading", "VH")], "pagination": {}}},
         "observations": {
             "result": {
                 "data": [
@@ -196,15 +229,17 @@ def test_census_degrades_gracefully_on_study_variable_failure():
     routes = {
         "programs": {"result": {"data": [_program("Nebraska", "P1")], "pagination": {}}},
         "studies": {"result": {"data": [_study("S1", "S1"), _study("S2", "S2")], "pagination": {}}},
-        "observationvariables": {"result": {"data": [], "pagination": {}}},
+        "variables": {"result": {"data": [], "pagination": {}}},
     }
 
     def flaky_get(url: str, params: dict | None = None) -> dict:
-        # S1's variable fetch raises 500; S2 and everything else succeed.
-        if "studies/S1/observationvariables" in url:
+        # S1's variable fetch fails on BOTH the primary and fallback endpoints;
+        # S2 and everything else succeed.  (The mock receives url and params
+        # separately, so check params and the fallback path.)
+        if (params or {}).get("studyDbId") == "S1" or "studies/S1/observationvariables" in url:
             raise urllib.error.HTTPError(url, 500, "Internal Server Error", {}, None)
         path = url.split("/")[-1].split("?")[0]
-        return routes.get(path, routes["observationvariables"])
+        return routes.get(path, routes["variables"])
 
     client = t3.BrApiClient(base_url="https://example.test/", sleep_seconds=0,
                             max_retries=1, retry_backoff=0, _getter=flaky_get)
