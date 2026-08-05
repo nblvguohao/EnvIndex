@@ -355,15 +355,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.out_results:
         import pandas as pd
-        rows = []
+        # Save per-crop incrementally so a slow crop never traps another
+        # crop's results (they write as soon as each crop's LOEO finishes).
         for res, crop in ((w_res, "wheat"), (c_res, "corn")):
-            for env, r in res.items():
-                rows.append({"crop": crop, "env_id": env, **r})
-        out = pd.DataFrame(rows)
-        args.out_results = str(args.out_results).replace("\\", "/")
-        Path(args.out_results).parent.mkdir(parents=True, exist_ok=True)
-        out.to_parquet(args.out_results, index=False)
-        print(f"[loe_pilot] saved {len(out)} per-env results -> {args.out_results}")
+            rows = [{"crop": crop, "env_id": env, **r} for env, r in res.items()]
+            out = pd.DataFrame(rows)
+            crop_path = str(args.out_results).replace("\\", "/").replace(".parquet", f"_{crop}.parquet")
+            Path(crop_path).parent.mkdir(parents=True, exist_ok=True)
+            out.to_parquet(crop_path, index=False)
+            print(f"[loe_pilot] saved {len(out)} {crop} per-env results -> {crop_path}")
 
     def summarize(name, res):
         rows = list(res.values())
