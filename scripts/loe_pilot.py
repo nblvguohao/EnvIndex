@@ -258,7 +258,7 @@ def _run_one_fold(
     }
 
 
-def _init_worker(items, params, counter, lock):
+def _init_worker(items, params, counter, lock, n_gpus):
     """ProcessPool worker init: pin a GPU (round-robin) and share data."""
     import os
 
@@ -266,7 +266,7 @@ def _init_worker(items, params, counter, lock):
     with lock:
         gpu = counter.value
         counter.value += 1
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu % n_gpus)
     _SHARED = {"items": items, "params": params}
 
 
@@ -320,7 +320,7 @@ def run_loe(
         max_workers=fold_workers,
         mp_context=ctx,
         initializer=_init_worker,
-        initargs=(items, params, counter, lock),
+        initargs=(items, params, counter, lock, n_gpus),
     ) as pool:
         for held, r in pool.map(_run_fold_worker, envs):
             if r:
