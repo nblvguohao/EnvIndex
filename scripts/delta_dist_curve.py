@@ -48,7 +48,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _train_quick_encoder(items, device, epochs=15):
+def _train_quick_encoder(items, device, epochs=80):
     import torch
     import torch.nn as nn
     from envindex.train import EnvIndexModule
@@ -106,23 +106,115 @@ def main(argv: list[str] | None = None) -> int:
     res = pd.read_parquet(args.results)
     print(f"[delta_dist] loaded {len(res)} per-env results")
 
-    # compute embeddings + dist for all envs across both crops
-    all_items = []
-    w_items, _ = load_wheat(args.n_envs_wheat, args.seed)
-    c_items, _ = load_corn(args.n_envs_corn, args.seed)
-    for it in w_items:
-        it["crop"] = "wheat"
-    for it in c_items:
-        it["crop"] = "corn"
-    all_items = w_items + c_items
+    # Environment-level distance in the R1 feature space (standardized
+    # Euclidean k-NN).  This spreads environments far better than the weak
+    # pilot encoder's cosine embedding distance (which collapses to ~0), and is
+    # the interpretable "environmental dissimilarity" behind the protocol's
+    # dist(e).  Computed per crop with its own feature scale.
+    dist: dict[str, float] = {}
+    for crop, items in _items_for_result_envs(res, args).items():
+        if not items:
+            continue
+        # one feature matrix per environment (identical within an env)
+        env_mats = {}
+        for it in items:
+            env_mats.setdefault(it["env_id"], it["x"])
+        env_ids = sorted(env_mats)
+        flat = np.stack([np.nan_to_num(env_mats[e]).flatten() for e in env_ids])
+        mu, sd = flat.mean(0), flat.std(0) + 1e-6
+        zf = (flat - mu) / sd
+        d = np.linalg.norm(zf[:, None, :] - zf[None, :, :], axis=-1)
+        np.fill_diagonal(d, np.inf)
+        knn = np.sort(d, axis=1)[:, :5].mean(1)
+        for e, v in zip(env_ids, knn):
+            dist[e] = float(v)
+        print(f"[delta_dist] {crop}: env-feature dist on {len(env_ids)} envs, "
+              f"range ({min(dist[e] for e in env_ids):.4f}, {max(dist[e] for e in env_ids):.4f})")
 
-    print("[delta_dist] training global encoder for dist(e) ...")
-    module = _train_quick_encoder(all_items, args.device)
-    z = encode_all(module, all_items, args.device)
-    dist = environment_distance(z, k=5)
     dist_df = pd.DataFrame([{"env_id": e, "dist": d} for e, d in dist.items()])
     df = res.merge(dist_df, on="env_id", how="inner")
-    print(f"[delta_dist] merged {len(df)} envs with dist")
+    print(f"[delta_dist] merged {len(df)} envs with dist (dist range {df['dist'].min():.4f}-{df['dist'].max():.4f})")
+
+    # per-crop binned means + bootstrap CI
+    frames = []
+    for crop, g in df.groupby("crop"):
+        bc = bootstrap_ci(g["dist"].to_numpy(), g["delta"].to_numpy(), args.n_bins, args.bootstrap, args.seed)
+        bc["crop"] = crop
+        frames.append(bc)
+    bins_df = pd.concat(frames, ignore_index=True)
+
+    df.to_csv(args.out_csv, index=False)
+    print(f"[delta_dist] csv -> {args.out_csv}")
+
+    # figure: scatter + binned mean ± CI + LOESS, per crop
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
+    for ax, (crop, g) in zip(axes, df.groupby("crop")):
+        ax.scatter(g["dist"], g["delta"], s=8, alpha=0.4, label=f"{crop} envs")
+        bc = bins_df[bins_df["crop"] == crop]
+        ax.errorbar((bc["dist_lo"] + bc["dist_hi"]) / 2, bc["mean"],
+                    yerr=[bc["mean"] - bc["ci_lo"], bc["ci_hi"] - bc["mean"]],
+                    fmt="o-", color="red", capsize=3, label="binned mean ± 95% CI")
+        sm = lowess(g["delta"].to_numpy(), g["dist"].to_numpy(), frac=0.5)
+        ax.plot(sm[:, 0], sm[:, 1], "--", color="blue", label="LOESS", alpha=0.7)
+        ax.axhline(0, color="gray", lw=0.7)
+        ax.set_xlabel("dist(e)  (env-feature Euclidean k-NN)")
+        ax.set_ylabel("Δ(e) = PCC(G∘z) − PCC(G+E)")
+        ax.set_title(f"{crop}  (n={len(g)})")
+        ax.legend(fontsize=8)
+    fig.suptitle("G×E predictability boundary: Δ vs environmental distance")
+    fig.tight_layout()
+    args.out_fig.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(args.out_fig, dpi=150)
+    print(f"[delta_dist] figure -> {args.out_fig}")
+
+    print("[delta_dist] binned summary:")
+    print(bins_df.round(4).to_string(index=False))
+    return 0
+
+
+def _items_for_result_envs(res: pd.DataFrame, args) -> dict[str, list[dict]]:
+    """Rebuild environment items restricted to the result env_ids, per crop."""
+    import numpy as np
+    import pandas as pd
+
+    result_envs = set(res["env_id"])
+    out: dict[str, list[dict]] = {}
+
+    # wheat: ESWYT rows filtered to result env_ids (env_id = loc_year)
+    wheat = res[res["crop"] == "wheat"]["env_id"]
+    if len(wheat):
+        df = pd.read_csv(ROOT / "data/cimmyt/ESWYT_Obs_Sim_Yld_Phe_Climate_All.tab", sep="\t")
+        df["env_id"] = df["loc"].astype(str) + "_" + df["year"].astype(str)
+        df = df[df["env_id"].isin(wheat)].dropna(subset=["yld"])
+        stage = ["veg", "rep", "gfi"]
+        feats = ["tavg", "tdr", "gdd30", "rs", "p", "rh", "vpd", "ws"]
+        items = []
+        for _, row in df.iterrows():
+            mat = np.array([[row.get(f"{f}_{s}", np.nan) for f in feats] for s in stage], dtype=np.float32)
+            items.append({"env_id": row["env_id"], "geno": str(row["gen"]), "y": float(row["yld"]),
+                          "x": mat, "env_label": int(row["year"])})
+        out["wheat"] = items
+
+    # corn: G2F phenotype + corn_features filtered to result env_ids
+    corn = res[res["crop"] == "corn"]["env_id"]
+    if len(corn):
+        from envindex.corn_features import load_corn_envs
+        pheno = pd.read_parquet(ROOT.parent / "nc/data/processed/g2f/phenotype.parquet")
+        pheno = pheno.dropna(subset=["phenotype_value", "genotype_id", "environment_id"])
+        envs = load_corn_envs(str(ROOT.parent / "nc/data/processed/g2f/weather_daily.parquet"),
+                              str(ROOT.parent / "nc/data/processed/g2f/environment.parquet"),
+                              n_envs=500, seed=0)  # load all, filter below
+        items = []
+        for env_id, info in envs.items():
+            if env_id not in set(corn):
+                continue
+            sub = pheno[pheno["environment_id"] == env_id]
+            for _, row in sub.head(300).iterrows():
+                items.append({"env_id": env_id, "geno": str(row["genotype_id"]),
+                              "y": float(row["phenotype_value"]), "x": info["x"], "env_label": 0})
+        out["corn"] = items
+
+    return out
 
     # per-crop binned means + bootstrap CI
     frames = []
