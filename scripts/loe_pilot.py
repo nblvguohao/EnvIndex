@@ -328,6 +328,19 @@ def run_loe(
     return results
 
 
+def _save_crop_results(results: dict, crop: str, out_results: str) -> None:
+    """Save one crop's per-environment results immediately (never trapped by a
+    slow/failing later crop)."""
+    import pandas as pd
+
+    rows = [{"crop": crop, "env_id": env, **r} for env, r in results.items()]
+    out = pd.DataFrame(rows)
+    crop_path = str(out_results).replace("\\", "/").replace(".parquet", f"_{crop}.parquet")
+    Path(crop_path).parent.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(crop_path, index=False)
+    print(f"[loe_pilot] saved {len(out)} {crop} per-env results -> {crop_path}")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     torch.manual_seed(args.seed)
@@ -342,28 +355,24 @@ def main(argv: list[str] | None = None) -> int:
     w_res = run_loe(w_items, args.d_embed, args.d_geno, args.rank, args.epochs, args.device, args.seed,
                     batch_size=args.batch_size, num_workers=args.num_workers,
                     fold_workers=args.fold_workers, n_gpus=args.n_gpus)
+    if args.out_results:
+        _save_crop_results(w_res, "wheat", args.out_results)
 
+    c_res: dict = {}
     print("[loe_pilot] loading corn G2F ...")
     c_items, c_envs = load_corn(args.n_envs_corn, args.seed)
     print(f"[loe_pilot] corn: {len(c_items)} rows, {len(c_envs)} envs")
-    if args.strata > 0:
-        c_items = _apply_strata(c_items, args.strata, args.target, args.device)
-        print(f"[loe_pilot] corn stratified -> {len(set(i['env_id'] for i in c_items))} envs")
-    c_res = run_loe(c_items, args.d_embed, args.d_geno, args.rank, args.epochs, args.device, args.seed,
-                    batch_size=args.batch_size, num_workers=args.num_workers,
-                    fold_workers=args.fold_workers, n_gpus=args.n_gpus)
-
-    if args.out_results:
-        import pandas as pd
-        # Save per-crop incrementally so a slow crop never traps another
-        # crop's results (they write as soon as each crop's LOEO finishes).
-        for res, crop in ((w_res, "wheat"), (c_res, "corn")):
-            rows = [{"crop": crop, "env_id": env, **r} for env, r in res.items()]
-            out = pd.DataFrame(rows)
-            crop_path = str(args.out_results).replace("\\", "/").replace(".parquet", f"_{crop}.parquet")
-            Path(crop_path).parent.mkdir(parents=True, exist_ok=True)
-            out.to_parquet(crop_path, index=False)
-            print(f"[loe_pilot] saved {len(out)} {crop} per-env results -> {crop_path}")
+    if c_items:
+        if args.strata > 0:
+            c_items = _apply_strata(c_items, args.strata, args.target, args.device)
+            print(f"[loe_pilot] corn stratified -> {len(set(i['env_id'] for i in c_items))} envs")
+        c_res = run_loe(c_items, args.d_embed, args.d_geno, args.rank, args.epochs, args.device, args.seed,
+                        batch_size=args.batch_size, num_workers=args.num_workers,
+                        fold_workers=args.fold_workers, n_gpus=args.n_gpus)
+        if args.out_results:
+            _save_crop_results(c_res, "corn", args.out_results)
+    else:
+        print("[loe_pilot] corn skipped (0 envs)")
 
     def summarize(name, res):
         rows = list(res.values())
