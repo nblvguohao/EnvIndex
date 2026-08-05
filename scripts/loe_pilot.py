@@ -60,6 +60,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fold-workers", type=int, default=1,
                         help="Parallel LOEO fold workers (>1 = ProcessPool, each pinned to a GPU)")
     parser.add_argument("--n-gpus", type=int, default=1, help="GPUs to round-robin fold workers across")
+    parser.add_argument("--out-results", type=str, default="",
+                        help="Save per-environment results (env_id, crop, pcc_*, delta) to this parquet")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args(argv)
 
@@ -350,6 +352,18 @@ def main(argv: list[str] | None = None) -> int:
     c_res = run_loe(c_items, args.d_embed, args.d_geno, args.rank, args.epochs, args.device, args.seed,
                     batch_size=args.batch_size, num_workers=args.num_workers,
                     fold_workers=args.fold_workers, n_gpus=args.n_gpus)
+
+    if args.out_results:
+        import pandas as pd
+        rows = []
+        for res, crop in ((w_res, "wheat"), (c_res, "corn")):
+            for env, r in res.items():
+                rows.append({"crop": crop, "env_id": env, **r})
+        out = pd.DataFrame(rows)
+        args.out_results = str(args.out_results).replace("\\", "/")
+        Path(args.out_results).parent.mkdir(parents=True, exist_ok=True)
+        out.to_parquet(args.out_results, index=False)
+        print(f"[loe_pilot] saved {len(out)} per-env results -> {args.out_results}")
 
     def summarize(name, res):
         rows = list(res.values())
