@@ -62,6 +62,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--n-gpus", type=int, default=1, help="GPUs to round-robin fold workers across")
     parser.add_argument("--out-results", type=str, default="",
                         help="Save per-environment results (env_id, crop, pcc_*, delta) to this parquet")
+    parser.add_argument("--embed-mode", choices=["learned", "pca"], default="learned",
+                        help="learned=EnvIndex encoder; pca=PCA projection control (protocol §5-13)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args(argv)
 
@@ -140,6 +142,7 @@ def _run_one_fold(
     seed: int,
     batch_size: int,
     num_workers: int,
+    embed_mode: str = "learned",
 ) -> tuple[str, dict]:
     """Train on all-but-held environment, predict held-out, return metrics."""
     torch.manual_seed(seed)
@@ -205,6 +208,15 @@ def _run_one_fold(
         rank=rank,
         n_genotypes=len(geno2idx) + 1,
     ).to(device)
+    if embed_mode == "pca":
+        # PCA control: fit projection on the TRAINING fold's stage features only
+        # (leakage-safe), set it as the fixed encoder.
+        flat = np.stack([np.nan_to_num(i["x"]).reshape(-1) for i in train_items])
+        center = flat.mean(0)
+        Xc = flat - center
+        _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
+        W = Vt[:d_embed].T.astype(np.float32)  # (in_features, d_embed)
+        module.encoder.set_projection(torch.from_numpy(W).to(device))
     opt = torch.optim.AdamW(module.parameters(), lr=3e-3, weight_decay=1e-4)
 
     for _ in range(epochs):
@@ -278,8 +290,8 @@ def _run_fold_worker(held):
     if n_held == 0:
         print(f"[worker] WARN no items for held={held}", flush=True)
         return held, {}
-    d_embed, d_geno, rank, epochs, batch_size, num_workers, seed = params
-    return _run_one_fold(items, held, d_embed, d_geno, rank, epochs, "cuda", seed, batch_size, num_workers)
+    d_embed, d_geno, rank, epochs, batch_size, num_workers, seed, embed_mode = params
+    return _run_one_fold(items, held, d_embed, d_geno, rank, epochs, "cuda", seed, batch_size, num_workers, embed_mode)
 
 
 def run_loe(
@@ -294,6 +306,7 @@ def run_loe(
     num_workers: int = 0,
     fold_workers: int = 1,
     n_gpus: int = 1,
+    embed_mode: str = "learned",
 ) -> dict:
     """Leave-one-environment-out.  `fold_workers > 1` runs folds in parallel
     processes, each pinned to a GPU round-robin (improvement #4)."""
@@ -301,7 +314,7 @@ def run_loe(
     if fold_workers <= 1:
         results = {}
         for held in envs:
-            h, r = _run_one_fold(items, held, d_embed, d_geno, rank, epochs, device, seed, batch_size, num_workers)
+            h, r = _run_one_fold(items, held, d_embed, d_geno, rank, epochs, device, seed, batch_size, num_workers, embed_mode)
             if r:
                 results[h] = r
         return results
@@ -312,7 +325,7 @@ def run_loe(
     # spawn (not fork): the parent has an initialized CUDA context; forking a
     # subprocess that uses CUDA raises "Cannot re-initialize CUDA".
     ctx = mp.get_context("spawn")
-    params = (d_embed, d_geno, rank, epochs, batch_size, num_workers, seed)
+    params = (d_embed, d_geno, rank, epochs, batch_size, num_workers, seed, embed_mode)
     counter = ctx.Manager().Value("i", 0)
     lock = ctx.Manager().Lock()
     results = {}
@@ -354,7 +367,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[loe_pilot] wheat stratified -> {len(set(i['env_id'] for i in w_items))} envs")
     w_res = run_loe(w_items, args.d_embed, args.d_geno, args.rank, args.epochs, args.device, args.seed,
                     batch_size=args.batch_size, num_workers=args.num_workers,
-                    fold_workers=args.fold_workers, n_gpus=args.n_gpus)
+                    fold_workers=args.fold_workers, n_gpus=args.n_gpus,
+                    embed_mode=args.embed_mode)
     if args.out_results:
         _save_crop_results(w_res, "wheat", args.out_results)
 
@@ -368,7 +382,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[loe_pilot] corn stratified -> {len(set(i['env_id'] for i in c_items))} envs")
         c_res = run_loe(c_items, args.d_embed, args.d_geno, args.rank, args.epochs, args.device, args.seed,
                         batch_size=args.batch_size, num_workers=args.num_workers,
-                        fold_workers=args.fold_workers, n_gpus=args.n_gpus)
+                        fold_workers=args.fold_workers, n_gpus=args.n_gpus,
+                        embed_mode=args.embed_mode)
         if args.out_results:
             _save_crop_results(c_res, "corn", args.out_results)
     else:

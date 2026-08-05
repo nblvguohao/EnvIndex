@@ -134,6 +134,34 @@ class _ChannelMixing(nn.Module):
 # multi-task heads
 # --------------------------------------------------------------------------
 
+class FixedProjectionEncoder(nn.Module):
+    """Drop-in encoder replacement for the PCA control arm (protocol §5-13).
+
+    z_e = flatten(x) @ W, where W is a fixed (n_stages*n_features, d_embed)
+    projection (e.g. PCA components fitted on the training fold only).
+    """
+
+    def __init__(self, in_features: int, d_embed: int) -> None:
+        super().__init__()
+        self.W: torch.Tensor | None = None
+        self.d_embed = d_embed
+
+    def set_projection(self, W: torch.Tensor) -> None:
+        self.W = W
+
+    def forward(self, x: torch.Tensor, static: torch.Tensor | None = None) -> torch.Tensor:
+        if self.W is None:
+            raise RuntimeError("FixedProjectionEncoder.set_projection must be called before use")
+        batch = x.shape[0]
+        z = x.reshape(batch, -1) @ self.W  # (B, d_embed)
+        if static is not None:
+            z = torch.cat([z, static], dim=-1)
+        return z
+
+    def n_parameters(self) -> int:
+        return int(self.W.numel()) if self.W is not None else 0
+
+
 class EnvMeanHead(nn.Module):
     """Auxiliary task A: linear readout of environment mean yield from z_e."""
 

@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
-from envindex.encoder import EnvMeanHead, InteractionHead, MLPMixerEncoder, infonce_loss
+from envindex.encoder import EnvMeanHead, FixedProjectionEncoder, InteractionHead, MLPMixerEncoder, infonce_loss
 
 
 class EnvIndexModule(nn.Module):
@@ -39,14 +39,19 @@ class EnvIndexModule(nn.Module):
         n_static: int = 0,
         n_genotypes: int | None = None,
         learn_geno_emb: bool = True,
+        embed_mode: str = "learned",
     ) -> None:
         super().__init__()
-        self.encoder = MLPMixerEncoder(
-            n_stages=n_stages,
-            n_features=n_features,
-            d_embed=d_embed,
-            n_static=n_static,
-        )
+        if embed_mode == "pca":
+            # PCA control (protocol §5-13): fixed projection, no learned encoder.
+            self.encoder = FixedProjectionEncoder(n_stages * n_features, d_embed)
+        else:
+            self.encoder = MLPMixerEncoder(
+                n_stages=n_stages,
+                n_features=n_features,
+                d_embed=d_embed,
+                n_static=n_static,
+            )
         self.aux_env_mean = EnvMeanHead(d_embed)
         self.geno_embedding: nn.Embedding | None = None
         if learn_geno_emb and n_genotypes is not None:
