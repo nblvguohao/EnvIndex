@@ -47,7 +47,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--n-envs", type=int, default=0, help="Limit number of environments (0 = all)")
     parser.add_argument("--out", type=Path, default=DATA / "weather_daily_power.parquet")
     parser.add_argument("--gdd-base", type=float, default=0.0, help="Wheat GDD base temperature (C)")
-    parser.add_argument("--sleep", type=float, default=1.5, help="Seconds between API calls (rate limit)")
+    parser.add_argument("--sleep", type=float, default=0.0, help="Seconds between API calls (0 when parallel)")
+    parser.add_argument("--workers", type=int, default=8, help="Parallel API workers (NASA POWER ~50 req/min anonymous)")
     return parser.parse_args(argv)
 
 
@@ -119,28 +120,43 @@ def env_weather(env: pd.Series, gdd_base: float) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _extract_one(env: pd.Series, gdd_base: float) -> tuple[str, pd.DataFrame | None, str]:
+    try:
+        return env["env_id"], env_weather(env, gdd_base), ""
+    except Exception as exc:
+        return env["env_id"], None, f"{type(exc).__name__}: {exc}"
+
+
 def main(argv: list[str] | None = None) -> int:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     args = _parse_args(argv)
     envs = build_env_table(args.eswyt, args.locations)
     if args.n_envs > 0:
         envs = envs.head(args.n_envs)
-    print(f"[nasa_power] {len(envs)} environments to extract")
+    print(f"[nasa_power] {len(envs)} environments to extract with {args.workers} workers")
 
     frames = []
-    for i, (_, env) in enumerate(envs.iterrows()):
-        try:
-            w = env_weather(env, args.gdd_base)
-            frames.append(w)
-            print(f"[nasa_power] {i+1}/{len(envs)} {env['env_id']} ({len(w)} days)", flush=True)
-        except Exception as exc:
-            print(f"[nasa_power] FAIL {env['env_id']}: {type(exc).__name__}: {exc}", file=sys.stderr)
-        time.sleep(args.sleep)
+    n_fail = 0
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(_extract_one, row, args.gdd_base): env_id for env_id, row in envs.iterrows()}
+        done = 0
+        for fut in as_completed(futures):
+            env_id, w, err = fut.result()
+            done += 1
+            if w is not None and len(w):
+                frames.append(w)
+                print(f"[nasa_power] {done}/{len(envs)} {env_id} ({len(w)} days)", flush=True)
+            else:
+                n_fail += 1
+                print(f"[nasa_power] FAIL {env_id}: {err}", file=sys.stderr)
+            time.sleep(args.sleep)
 
     if frames:
         out = pd.concat(frames, ignore_index=True)
         args.out.parent.mkdir(parents=True, exist_ok=True)
         out.to_parquet(args.out, index=False)
-        print(f"[nasa_power] weather -> {args.out} ({len(out)} rows, {out['environment_id'].nunique()} envs)")
+        print(f"[nasa_power] weather -> {args.out} ({len(out)} rows, {out['environment_id'].nunique()} envs, {n_fail} failed)")
     return 0
 
 
