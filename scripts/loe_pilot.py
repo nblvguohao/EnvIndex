@@ -207,6 +207,7 @@ def _run_one_fold(
         d_geno=d_geno,
         rank=rank,
         n_genotypes=len(geno2idx) + 1,
+        embed_mode=embed_mode,
     ).to(device)
     if embed_mode == "pca":
         # PCA control: fit projection on the TRAINING fold's stage features only
