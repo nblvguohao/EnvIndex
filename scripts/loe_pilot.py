@@ -211,12 +211,15 @@ def _run_one_fold(
     ).to(device)
     if embed_mode == "pca":
         # PCA control: fit projection on the TRAINING fold's stage features only
-        # (leakage-safe), set it as the fixed encoder.
+        # (leakage-safe), set it as the fixed encoder.  Pad to d_embed dims so
+        # the heads (which expect d_embed) receive the right z dimension.
         flat = np.stack([np.nan_to_num(i["x"]).reshape(-1) for i in train_items])
-        center = flat.mean(0)
-        Xc = flat - center
+        Xc = flat - flat.mean(0)
         _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
-        W = Vt[:d_embed].T.astype(np.float32)  # (in_features, d_embed)
+        flat_dim = flat.shape[1]
+        W = np.zeros((flat_dim, d_embed), dtype=np.float32)
+        k = min(flat_dim, d_embed)
+        W[:, :k] = Vt[:k].T  # top-k PCA components; remaining dims are zero
         module.encoder.set_projection(torch.from_numpy(W).to(device))
     opt = torch.optim.AdamW(module.parameters(), lr=3e-3, weight_decay=1e-4)
 
