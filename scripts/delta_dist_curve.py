@@ -214,6 +214,28 @@ def _items_for_result_envs(res: pd.DataFrame, args) -> dict[str, list[dict]]:
                               "y": float(row["phenotype_value"]), "x": info["x"], "env_label": 0})
         out["corn"] = items
 
+    # oat: T3 UOPN + NASA POWER features, cached per env by oat_loe.build_oat_env_features
+    oat = res[res["crop"] == "oat"]["env_id"]
+    if len(oat):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from oat_loe import build_oat_env_features
+        env_x = build_oat_env_features(ROOT / "data/t3/oat_items_100.parquet", ROOT / "data/t3/oat_env_features.pkl")
+        items = [{"env_id": e, "geno": "_dummy", "y": 0.0, "x": x, "env_label": 0}
+                 for e, x in env_x.items() if e in set(oat)]
+        out["oat"] = items
+
+    # barley: T3 WRBN + NASA POWER features, cached per env by barley_loe.build_barley_env_features
+    barley = res[res["crop"] == "barley"]["env_id"]
+    if len(barley):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from barley_loe import build_barley_env_features
+        env_x = build_barley_env_features(ROOT / "data/t3/barley_items_wrbn.parquet",
+                                          ROOT / "data/t3/trials_catalog_barley.parquet",
+                                          ROOT / "data/t3/barley_env_features.pkl")
+        items = [{"env_id": e, "geno": "_dummy", "y": 0.0, "x": x, "env_label": 0}
+                 for e, x in env_x.items() if e in set(barley)]
+        out["barley"] = items
+
     return out
 
     # per-crop binned means + bootstrap CI

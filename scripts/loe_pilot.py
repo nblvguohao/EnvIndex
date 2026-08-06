@@ -64,13 +64,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Save per-environment results (env_id, crop, pcc_*, delta) to this parquet")
     parser.add_argument("--embed-mode", choices=["learned", "pca"], default="learned",
                         help="learned=EnvIndex encoder; pca=PCA projection control (protocol §5-13)")
+    parser.add_argument("--plot-cap", type=int, default=0,
+                        help="Cap plots per environment (0 = all; reduces per-fold data for fast pilots)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args(argv)
 
 
 # ---------------------------------------------------------------- loaders
 
-def load_wheat(envs_to_use: int, seed: int) -> tuple[list[dict], list[str]]:
+def load_wheat(envs_to_use: int, seed: int, plot_cap: int = 0) -> tuple[list[dict], list[str]]:
     df = pd.read_csv(ESWYT, sep="\t")
     df["env_id"] = df["loc"].astype(str) + "_" + df["year"].astype(str)
     # keep envs with enough plots for meaningful PCC
@@ -81,6 +83,8 @@ def load_wheat(envs_to_use: int, seed: int) -> tuple[list[dict], list[str]]:
     rng = np.random.default_rng(seed)
     envs = sorted(rng.choice(sorted(df["env_id"].unique()), size=min(envs_to_use, len(usable)), replace=False))
     df = df[df["env_id"].isin(envs)].copy()
+    if plot_cap > 0:
+        df = df.groupby("env_id").head(plot_cap)
     stage_suffix = ["veg", "rep", "gfi"]
     feats = ["tavg", "tdr", "gdd30", "rs", "p", "rh", "vpd", "ws"]
     items = []
@@ -99,14 +103,15 @@ def load_wheat(envs_to_use: int, seed: int) -> tuple[list[dict], list[str]]:
     return items, sorted(set(i["env_id"] for i in items))
 
 
-def load_corn(envs_to_use: int, seed: int) -> tuple[list[dict], list[str]]:
+def load_corn(envs_to_use: int, seed: int, plot_cap: int = 0) -> tuple[list[dict], list[str]]:
     pheno = pd.read_parquet(G2F_PHENO)
     pheno = pheno.dropna(subset=["phenotype_value", "genotype_id", "environment_id"])
     envs = load_corn_envs(str(G2F_WEATHER), str(G2F_ENV), n_envs=envs_to_use, seed=seed)
+    cap = plot_cap if plot_cap > 0 else 300
     items = []
     for env_id, info in envs.items():
         sub = pheno[pheno["environment_id"] == env_id]
-        for _, row in sub.head(300).iterrows():  # cap plots per env for pilot speed
+        for _, row in sub.head(cap).iterrows():  # cap plots per env for pilot speed
             items.append(
                 {
                     "crop": "corn",
@@ -364,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
     np.random.seed(args.seed)
 
     print("[loe_pilot] loading wheat ESWYT ...")
-    w_items, w_envs = load_wheat(args.n_envs_wheat, args.seed)
+    w_items, w_envs = load_wheat(args.n_envs_wheat, args.seed, plot_cap=args.plot_cap)
     print(f"[loe_pilot] wheat: {len(w_items)} rows, {len(w_envs)} envs")
     if args.strata > 0:
         w_items = _apply_strata(w_items, args.strata, args.target, args.device)
@@ -378,7 +383,7 @@ def main(argv: list[str] | None = None) -> int:
 
     c_res: dict = {}
     print("[loe_pilot] loading corn G2F ...")
-    c_items, c_envs = load_corn(args.n_envs_corn, args.seed)
+    c_items, c_envs = load_corn(args.n_envs_corn, args.seed, plot_cap=args.plot_cap)
     print(f"[loe_pilot] corn: {len(c_items)} rows, {len(c_envs)} envs")
     if c_items:
         if args.strata > 0:
