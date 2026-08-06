@@ -39,6 +39,8 @@ def _parse_args(argv=None):
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--plot-cap", type=int, default=100)
     parser.add_argument("--fold-workers", type=int, default=8)
+    parser.add_argument("--geno-offset", choices=["none", "empirical"], default="none",
+                        help="empirical = M3 fairness diagnostic (shared genotype main effect)")
     parser.add_argument("--n-gpus", type=int, default=2)
     parser.add_argument("--device", default="cuda")
     return parser.parse_args(argv)
@@ -189,7 +191,7 @@ def main(argv=None):
     # lightweight LOEO
     res = run_loe(items, d_embed=32, d_geno=32, rank=4, epochs=args.epochs, device=args.device,
                   seed=0, batch_size=512, fold_workers=args.fold_workers, n_gpus=args.n_gpus,
-                  embed_mode=args.embed_mode)
+                  embed_mode=args.embed_mode, geno_offset=args.geno_offset)
     args.out_results.parent.mkdir(parents=True, exist_ok=True)
     out = pd.DataFrame([{"crop": "oat", "env_id": e, **r} for e, r in res.items()])
     out.to_parquet(args.out_results, index=False)

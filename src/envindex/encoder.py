@@ -192,6 +192,13 @@ class InteractionHead(nn.Module):
         self.rank = rank
         if n_genotypes is not None:
             self.geno_main = nn.Embedding(n_genotypes, 1)
+            # Zero-init: nn.Embedding defaults to N(0,1), i.e. a random offset
+            # per genotype with sd ~1.  A genotype main effect is small next to
+            # that, and AdamW moves a parameter only ~lr per step, so the random
+            # init dominated and this path emitted noise (within-environment PCC
+            # ~0) while the multiplicative interaction term -- init at 0.02 --
+            # silently took over the main effect.
+            nn.init.zeros_(self.geno_main.weight)
         else:
             self.geno_main = None
         self.env_main = nn.Sequential(nn.Linear(d_embed, 32), nn.GELU(), nn.Linear(32, 1))

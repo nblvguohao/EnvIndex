@@ -64,6 +64,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Save per-environment results (env_id, crop, pcc_*, delta) to this parquet")
     parser.add_argument("--embed-mode", choices=["learned", "pca"], default="learned",
                         help="learned=EnvIndex encoder; pca=PCA projection control (protocol §5-13)")
+    parser.add_argument("--geno-offset", choices=["none", "empirical"], default="none",
+                        help="empirical = M3 fairness diagnostic: share one empirical genotype "
+                             "main effect between the neural arm and FW, compare residuals only")
     parser.add_argument("--plot-cap", type=int, default=0,
                         help="Cap plots per environment (0 = all; reduces per-fold data for fast pilots)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -135,6 +138,81 @@ def _pcc(a: np.ndarray, b: np.ndarray) -> float:
 
 _SHARED: dict = {}
 
+FW_MIN_ENVS = 3  # genotypes seen in fewer training environments get the population slope
+
+
+def _fit_fw(
+    train_items: list[dict],
+    held_items: list[dict],
+    train_env_mean: dict,
+    global_mean: float,
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    ridge_lambda: float = 1.0,
+    fixed_intercept: dict | None = None,
+) -> tuple[dict, float]:
+    """Finlay-Wilkinson reaction norm (protocol §5 baseline #4).
+
+        y_ij = mu + g_i + b_i * E_j
+
+    `E_j` is the environment index, defined as the environment's mean yield
+    deviation -- the literature-standard definition, fixed by
+    specs/delta_metric_redesign.md §4.1.  Per-genotype slopes `b_i` make FW
+    re-rank genotypes between environments, so unlike the additive G+E
+    baseline it does NOT collapse to the genotype main effect under a
+    within-environment ranking metric (amendment 2026-08-06(b) M3).
+
+    Leakage safety (spec §4.2): the held-out environment's index is NOT
+    observable -- its observed mean is the very quantity being predicted.  So
+    `E_e` is predicted by a ridge fitted on training environments only,
+    mapping standardized R1 stage features -> environment mean deviation.
+    The held-out environment's phenotypes are never touched.
+
+    Returns ({geno: (intercept, slope)}, predicted held-out env deviation).
+    """
+    # --- per-environment design, training fold only
+    env_ids = sorted(train_env_mean)
+    env_dev = {e: train_env_mean[e] - global_mean for e in env_ids}
+    env_x = {}
+    for i in train_items:
+        env_x.setdefault(i["env_id"], i["x"])
+
+    # --- ridge: standardized stage features -> environment mean deviation
+    X = np.stack([((np.nan_to_num(env_x[e]) - x_mean) / x_std).ravel() for e in env_ids])
+    y = np.array([env_dev[e] for e in env_ids], dtype=np.float64)
+    Xc_mean = X.mean(0)
+    Xc = X - Xc_mean
+    d = Xc.shape[1]
+    w = np.linalg.solve(Xc.T @ Xc + ridge_lambda * np.eye(d), Xc.T @ y)
+    held_x = ((np.nan_to_num(held_items[0]["x"]) - x_mean) / x_std).ravel()
+    env_dev_hat = float((held_x - Xc_mean) @ w)
+
+    # --- per-genotype OLS of (env deviation -> yield), on training envs only
+    by_geno: dict = {}
+    for i in train_items:
+        by_geno.setdefault(i["geno"], {}).setdefault(i["env_id"], []).append(i["y"])
+
+    coef = {}
+    for g, per_env in by_geno.items():
+        ex = np.array([env_dev[e] for e in per_env], dtype=np.float64)
+        ey = np.array([float(np.mean(v)) for v in per_env.values()], dtype=np.float64)
+        # need enough distinct environment indices to identify a slope
+        identified = len(ex) >= FW_MIN_ENVS and float(np.ptp(ex)) > 1e-9
+        if fixed_intercept is not None:
+            # fairness diagnostic: intercept is pinned to the shared empirical
+            # genotype main effect, so only the slope (the interaction term) is
+            # fitted -- through the origin on the already-residualised y.
+            b0 = float(fixed_intercept.get(g, 0.0))
+            slope = float((ex @ (ey - b0)) / (ex @ ex)) if identified and float(ex @ ex) > 1e-12 else 1.0
+            intercept = b0
+        elif identified:
+            slope, intercept = np.polyfit(ex, ey, 1)
+        else:
+            # fall back to the population slope (b=1), i.e. purely additive
+            slope, intercept = 1.0, float(ey.mean())
+        coef[g] = (float(intercept), float(slope))
+    return coef, env_dev_hat
+
 
 def _run_one_fold(
     items: list[dict],
@@ -148,8 +226,17 @@ def _run_one_fold(
     batch_size: int,
     num_workers: int,
     embed_mode: str = "learned",
+    geno_offset: str = "none",
 ) -> tuple[str, dict]:
-    """Train on all-but-held environment, predict held-out, return metrics."""
+    """Train on all-but-held environment, predict held-out, return metrics.
+
+    `geno_offset="empirical"` runs the M3 fairness diagnostic: both the neural
+    G∘z arm and the FW arm are given the *same* empirical genotype main effect
+    (the train-fold genotype mean), and each then models only the residual.
+    This isolates interaction-modelling quality from genotype-main-effect
+    quality -- without it, FW gets empirical genotype means for free while
+    G∘z has to learn them by SGD (specs/delta_metric_redesign.md §6).
+    """
     torch.manual_seed(seed)
     np.random.seed(seed)
     train_items = [i for i in items if i["env_id"] != held]
@@ -175,6 +262,38 @@ def _run_one_fold(
         geno_train_mean.setdefault(i["geno"], []).append(i["y"])
     geno_train_mean = {g: float(np.mean(v)) for g, v in geno_train_mean.items()}
 
+    # M3 fairness diagnostic: share one empirical genotype main effect between
+    # the neural arm and FW, so each is judged only on the residual it explains.
+    fair = geno_offset == "empirical"
+
+    def _offset(g: str) -> float:
+        return geno_train_mean.get(g, global_mean) if fair else 0.0
+
+    if fair:
+        resid_items = [{**i, "y": i["y"] - _offset(i["geno"])} for i in train_items]
+        resid_env_mean: dict = {}
+        for i in resid_items:
+            resid_env_mean.setdefault(i["env_id"], []).append(i["y"])
+        resid_env_mean = {e: float(np.mean(v)) for e, v in resid_env_mean.items()}
+        resid_global = float(np.mean([i["y"] for i in resid_items]))
+    else:
+        resid_items, resid_env_mean, resid_global = train_items, train_env_mean, global_mean
+
+    # Standardise the training target.  AdamW moves a parameter by ~lr per
+    # step, so with ~300 steps a raw target of ~5863 kg/ha (barley) is
+    # unreachable for the additive path and only the multiplicative
+    # interaction term can grow fast enough -- which silently turned the
+    # interaction into a stand-in for the genotype main effect.  Features
+    # were already standardised; the target was not.
+    _tr_y = np.array([i["y"] - _offset(i["geno"]) for i in train_items], dtype=np.float64)
+    y_mu = float(_tr_y.mean())
+    y_sd = float(_tr_y.std()) + 1e-8
+
+    fw_coef, fw_env_dev = _fit_fw(
+        resid_items, held_items, resid_env_mean, resid_global, x_mean, x_std,
+        fixed_intercept={g: 0.0 for g in geno_train_mean} if fair else None,
+    )
+
     def build_dataset(source):
         ds_items = []
         for i in source:
@@ -187,15 +306,16 @@ def _run_one_fold(
                     "g_emb": None,  # learnable via geno_idx (improvement #1)
                     "geno_idx": gidx,
                     "geno": i["geno"],
-                    "y": i["y"],
+                    "y": (i["y"] - _offset(i["geno"]) - y_mu) / y_sd,
+                    "y_raw": i["y"],
                     "env_id": i["env_id"],
                     "env_label": i["env_label"],
-                    "env_mean": train_env_mean.get(i["env_id"], global_mean),
+                    "env_mean": (resid_env_mean.get(i["env_id"], resid_global) - y_mu) / y_sd,
                 }
             )
         return ds_items
 
-    train_ds = EnvYieldDataset(build_dataset(train_items), {i["env_id"]: train_env_mean.get(i["env_id"], global_mean) for i in train_items})
+    train_ds = EnvYieldDataset(build_dataset(train_items), {i["env_id"]: resid_env_mean.get(i["env_id"], resid_global) for i in train_items})
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -245,36 +365,66 @@ def _run_one_fold(
     # predict held-out
     module.eval()
     hd = build_dataset(held_items)
-    ys, gz_pred, ge_pred, gm_pred, rz_pred = [], [], [], [], []
+    ys, gz_pred, ge_pred, gm_pred, rz_pred, fw_pred = [], [], [], [], [], []
+    gz_noint_pred, fw_noint_pred = [], []
     with torch.no_grad():
         for it in hd:
             x = torch.as_tensor(it["x"], dtype=torch.float32).unsqueeze(0).to(device)
             st_raw = it["static"] if it["static"] is not None else []
             st = torch.as_tensor(st_raw, dtype=torch.float32).unsqueeze(0).to(device)
             idx = torch.as_tensor([it["geno_idx"]], dtype=torch.long).to(device)
-            y_hat, _, _ = module(x, None, idx, st)  # learnable geno embedding
-            gz_pred.append(float(y_hat.squeeze().cpu()))
-            ys.append(it["y"])
+            off = _offset(it["geno"])  # 0.0 unless the fairness diagnostic is on
+            y_hat, _, z_e = module(x, None, idx, st)  # learnable geno embedding
+            gz_pred.append(off + y_mu + y_sd * float(y_hat.squeeze().cpu()))
+            # same model with the interaction term switched off, i.e. its own
+            # additive (bias + geno_main + env_main) part.  Pairing each arm
+            # against its OWN no-interaction version cancels genotype-side
+            # quality, which is what makes the Gz-vs-FW comparison fair.
+            h = module.main_head
+            ni = h.bias.expand(1)
+            if getattr(h, "geno_main", None) is not None:
+                ni = ni + h.geno_main(idx).squeeze(-1)
+            ni = ni + h.env_main(z_e).squeeze(-1)
+            gz_noint_pred.append(off + y_mu + y_sd * float(ni.squeeze().cpu()))
+            ys.append(it["y_raw"])  # evaluate on the original scale
             # G+E additive baseline: env mean + genotype deviation
             gdev = geno_train_mean.get(it["geno"], global_mean) - global_mean
             ge_pred.append(float(it["env_mean"] + gdev))
             # genotype-mean baseline (GBLUP-G-lite)
             gm_pred.append(geno_train_mean.get(it["geno"], global_mean))
+            # FW reaction norm: intercept + slope * predicted env index
+            b0, b1 = fw_coef.get(it["geno"], (resid_global if fair else global_mean, 1.0))
+            fw_pred.append(off + b0 + b1 * fw_env_dev)
+            fw_noint_pred.append(off + b0)  # FW without its slope term
             # random-embedding negative control (protocol §5-12): G+E with random z
             rz = torch.randn(d_embed, device=device)
             rz_y = module.main_head.bias + module.main_head.env_main(rz.unsqueeze(0)).squeeze(0) \
                 + (module.geno_embedding(idx) @ module.main_head.U * (rz.unsqueeze(0) @ module.main_head.V)).sum(-1).squeeze(0)
-            rz_pred.append(float(rz_y.squeeze().cpu()))
+            rz_pred.append(off + y_mu + y_sd * float(rz_y.squeeze().cpu()))
     ys = np.array(ys)
     pcc_gz = _pcc(ys, np.array(gz_pred))
     pcc_ge = _pcc(ys, np.array(ge_pred))
     pcc_gm = _pcc(ys, np.array(gm_pred))
     pcc_rz = _pcc(ys, np.array(rz_pred))
+    pcc_fw = _pcc(ys, np.array(fw_pred))
+    pcc_gz_noint = _pcc(ys, np.array(gz_noint_pred))
+    pcc_fw_noint = _pcc(ys, np.array(fw_noint_pred))
     return held, {
         "pcc_gz": pcc_gz,
         "pcc_ge": pcc_ge,
         "pcc_gm": pcc_gm,
         "pcc_rz": pcc_rz,
+        "pcc_fw": pcc_fw,
+        "pcc_gz_noint": pcc_gz_noint,
+        "pcc_fw_noint": pcc_fw_noint,
+        # within-model interaction gain: each arm vs its OWN additive version,
+        # so genotype-main-effect quality cancels (M3 fairness diagnostic v2)
+        "gain_gz": pcc_gz - pcc_gz_noint,
+        "gain_fw": pcc_fw - pcc_fw_noint,
+        "delta_gain": (pcc_gz - pcc_gz_noint) - (pcc_fw - pcc_fw_noint),
+        # primary metric (spec §4.1): explicit interaction vs FW reaction norm
+        "delta_fw": pcc_gz - pcc_fw,
+        # appendix metric: environment conditioning vs the no-GxE null
         "delta": pcc_gz - pcc_ge,
     }
 
@@ -299,8 +449,8 @@ def _run_fold_worker(held):
     if n_held == 0:
         print(f"[worker] WARN no items for held={held}", flush=True)
         return held, {}
-    d_embed, d_geno, rank, epochs, batch_size, num_workers, seed, embed_mode = params
-    return _run_one_fold(items, held, d_embed, d_geno, rank, epochs, "cuda", seed, batch_size, num_workers, embed_mode)
+    d_embed, d_geno, rank, epochs, batch_size, num_workers, seed, embed_mode, geno_offset = params
+    return _run_one_fold(items, held, d_embed, d_geno, rank, epochs, "cuda", seed, batch_size, num_workers, embed_mode, geno_offset)
 
 
 def run_loe(
@@ -316,6 +466,7 @@ def run_loe(
     fold_workers: int = 1,
     n_gpus: int = 1,
     embed_mode: str = "learned",
+    geno_offset: str = "none",
 ) -> dict:
     """Leave-one-environment-out.  `fold_workers > 1` runs folds in parallel
     processes, each pinned to a GPU round-robin (improvement #4)."""
@@ -323,7 +474,7 @@ def run_loe(
     if fold_workers <= 1:
         results = {}
         for held in envs:
-            h, r = _run_one_fold(items, held, d_embed, d_geno, rank, epochs, device, seed, batch_size, num_workers, embed_mode)
+            h, r = _run_one_fold(items, held, d_embed, d_geno, rank, epochs, device, seed, batch_size, num_workers, embed_mode, geno_offset)
             if r:
                 results[h] = r
         return results
@@ -334,7 +485,7 @@ def run_loe(
     # spawn (not fork): the parent has an initialized CUDA context; forking a
     # subprocess that uses CUDA raises "Cannot re-initialize CUDA".
     ctx = mp.get_context("spawn")
-    params = (d_embed, d_geno, rank, epochs, batch_size, num_workers, seed, embed_mode)
+    params = (d_embed, d_geno, rank, epochs, batch_size, num_workers, seed, embed_mode, geno_offset)
     counter = ctx.Manager().Value("i", 0)
     lock = ctx.Manager().Lock()
     results = {}
@@ -377,7 +528,7 @@ def main(argv: list[str] | None = None) -> int:
     w_res = run_loe(w_items, args.d_embed, args.d_geno, args.rank, args.epochs, args.device, args.seed,
                     batch_size=args.batch_size, num_workers=args.num_workers,
                     fold_workers=args.fold_workers, n_gpus=args.n_gpus,
-                    embed_mode=args.embed_mode)
+                    embed_mode=args.embed_mode, geno_offset=args.geno_offset)
     if args.out_results:
         _save_crop_results(w_res, "wheat", args.out_results)
 
@@ -392,7 +543,7 @@ def main(argv: list[str] | None = None) -> int:
         c_res = run_loe(c_items, args.d_embed, args.d_geno, args.rank, args.epochs, args.device, args.seed,
                         batch_size=args.batch_size, num_workers=args.num_workers,
                         fold_workers=args.fold_workers, n_gpus=args.n_gpus,
-                        embed_mode=args.embed_mode)
+                        embed_mode=args.embed_mode, geno_offset=args.geno_offset)
         if args.out_results:
             _save_crop_results(c_res, "corn", args.out_results)
     else:
@@ -404,13 +555,17 @@ def main(argv: list[str] | None = None) -> int:
         ge = [r["pcc_ge"] for r in rows if not np.isnan(r["pcc_ge"])]
         gm = [r["pcc_gm"] for r in rows if not np.isnan(r["pcc_gm"])]
         rz = [r["pcc_rz"] for r in rows if not np.isnan(r["pcc_rz"])]
+        fw = [r["pcc_fw"] for r in rows if not np.isnan(r.get("pcc_fw", np.nan))]
+        dfw = [r["delta_fw"] for r in rows if not np.isnan(r.get("delta_fw", np.nan))]
         dl = [r["delta"] for r in rows if not np.isnan(r["delta"])]
         print(f"\n=== {name} LOEO ({len(rows)} held-out envs):")
         print(f"  PCC(Gz): {np.mean(gz):+.3f} +- {np.std(gz):.3f}  (n={len(gz)})")
+        print(f"  PCC(FW reaction norm): {np.mean(fw):+.3f} +- {np.std(fw):.3f}  (n={len(fw)})")
         print(f"  PCC(G+E): {np.mean(ge):+.3f} +- {np.std(ge):.3f}  (n={len(ge)})")
         print(f"  PCC(geno-mean GBLUP-lite): {np.mean(gm):+.3f} +- {np.std(gm):.3f}  (n={len(gm)})")
         print(f"  PCC(random-z control): {np.mean(rz):+.3f} +- {np.std(rz):.3f}  (n={len(rz)})")
-        print(f"  Delta = PCC(Gz)-PCC(G+E): {np.mean(dl):+.3f} +- {np.std(dl):.3f}  (n={len(dl)})")
+        print(f"  Delta_FW = PCC(Gz)-PCC(FW)  [PRIMARY]: {np.mean(dfw):+.3f} +- {np.std(dfw):.3f}  (n={len(dfw)})")
+        print(f"  Delta    = PCC(Gz)-PCC(G+E) [appendix]: {np.mean(dl):+.3f} +- {np.std(dl):.3f}  (n={len(dl)})")
         return dl
 
     summarize("wheat ESWYT", w_res)
