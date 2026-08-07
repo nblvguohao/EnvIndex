@@ -227,7 +227,8 @@ def _run_one_fold(
     num_workers: int,
     embed_mode: str = "learned",
     geno_offset: str = "none",
-) -> tuple[str, dict]:
+    dump_preds: bool = False,
+) -> tuple[str, dict, list | None]:
     """Train on all-but-held environment, predict held-out, return metrics.
 
     `geno_offset="empirical"` runs the M3 fairness diagnostic: both the neural
@@ -242,7 +243,7 @@ def _run_one_fold(
     train_items = [i for i in items if i["env_id"] != held]
     held_items = [i for i in items if i["env_id"] == held]
     if len(train_items) == 0 or len(held_items) < 3:
-        return held, {}
+        return held, {}, None
 
     geno2idx = {g: i for i, g in enumerate(sorted(set(i["geno"] for i in items)))}
     UNK = len(geno2idx)
@@ -375,6 +376,7 @@ def _run_one_fold(
     hd = build_dataset(held_items)
     ys, gz_pred, ge_pred, gm_pred, rz_pred, fw_pred = [], [], [], [], [], []
     gz_noint_pred, fw_noint_pred = [], []
+    dump_rows: list = []
     with torch.no_grad():
         for it in hd:
             x = torch.as_tensor(it["x"], dtype=torch.float32).unsqueeze(0).to(device)
@@ -409,6 +411,12 @@ def _run_one_fold(
             rz_y = module.main_head.bias + module.main_head.env_main(rz.unsqueeze(0)).squeeze(0) \
                 + (module.geno_embedding(idx) @ module.main_head.U * (rz.unsqueeze(0) @ module.main_head.V)).sum(-1).squeeze(0)
             rz_pred.append(off + y_mu + y_sd * float(rz_y.squeeze().cpu()))
+            if dump_preds:
+                # raw-scale per-plot predictions for the pooled SelectionGain
+                # metric (protocol §6) -- G∘z, FW, genotype-mean arms
+                dump_rows.append({"env_id": held, "geno": it["geno"], "y": it["y_raw"],
+                                  "pred_gz": gz_pred[-1], "pred_fw": fw_pred[-1],
+                                  "pred_gm": gm_pred[-1]})
     ys = np.array(ys)
     pcc_gz = _pcc(ys, np.array(gz_pred))
     pcc_ge = _pcc(ys, np.array(ge_pred))
@@ -434,7 +442,7 @@ def _run_one_fold(
         "delta_fw": pcc_gz - pcc_fw,
         # appendix metric: environment conditioning vs the no-GxE null
         "delta": pcc_gz - pcc_ge,
-    }
+    }, (dump_rows if dump_preds else None)
 
 
 def _init_worker(items, params, counter, lock, n_gpus):
@@ -459,9 +467,9 @@ def _run_fold_worker(held):
     n_held = len([i for i in items if i["env_id"] == held])
     if n_held == 0:
         print(f"[worker] WARN no items for held={held}", flush=True)
-        return held, {}
-    d_embed, d_geno, rank, epochs, batch_size, num_workers, seed, embed_mode, geno_offset = params
-    return _run_one_fold(items, held, d_embed, d_geno, rank, epochs, "cuda", seed, batch_size, num_workers, embed_mode, geno_offset)
+        return held, {}, None
+    d_embed, d_geno, rank, epochs, batch_size, num_workers, seed, embed_mode, geno_offset, dump_preds = params
+    return _run_one_fold(items, held, d_embed, d_geno, rank, epochs, "cuda", seed, batch_size, num_workers, embed_mode, geno_offset, dump_preds)
 
 
 def run_loe(
@@ -478,17 +486,25 @@ def run_loe(
     n_gpus: int = 1,
     embed_mode: str = "learned",
     geno_offset: str = "none",
+    dump_preds: bool = False,
 ) -> dict:
     """Leave-one-environment-out.  `fold_workers > 1` runs folds in parallel
-    processes, each pinned to a GPU round-robin (improvement #4)."""
+    processes, each pinned to a GPU round-robin (improvement #4).
+
+    With `dump_preds=True`, returns (results, preds) where preds is a list of
+    per-plot dicts {env_id, geno, y, pred_gz, pred_fw, pred_gm} on the raw
+    scale -- the input for pooled SelectionGain@10% (protocol §6)."""
     envs = sorted(set(i["env_id"] for i in items))
     if fold_workers <= 1:
         results = {}
+        preds: list = []
         for held in envs:
-            h, r = _run_one_fold(items, held, d_embed, d_geno, rank, epochs, device, seed, batch_size, num_workers, embed_mode, geno_offset)
+            h, r, p = _run_one_fold(items, held, d_embed, d_geno, rank, epochs, device, seed, batch_size, num_workers, embed_mode, geno_offset, dump_preds)
             if r:
                 results[h] = r
-        return results
+            if p:
+                preds.extend(p)
+        return (results, preds) if dump_preds else results
 
     from concurrent.futures import ProcessPoolExecutor
     import multiprocessing as mp
@@ -496,20 +512,23 @@ def run_loe(
     # spawn (not fork): the parent has an initialized CUDA context; forking a
     # subprocess that uses CUDA raises "Cannot re-initialize CUDA".
     ctx = mp.get_context("spawn")
-    params = (d_embed, d_geno, rank, epochs, batch_size, num_workers, seed, embed_mode, geno_offset)
+    params = (d_embed, d_geno, rank, epochs, batch_size, num_workers, seed, embed_mode, geno_offset, dump_preds)
     counter = ctx.Manager().Value("i", 0)
     lock = ctx.Manager().Lock()
     results = {}
+    preds = []
     with ProcessPoolExecutor(
         max_workers=fold_workers,
         mp_context=ctx,
         initializer=_init_worker,
         initargs=(items, params, counter, lock, n_gpus),
     ) as pool:
-        for held, r in pool.map(_run_fold_worker, envs):
+        for held, r, p in pool.map(_run_fold_worker, envs):
             if r:
                 results[held] = r
-    return results
+            if p:
+                preds.extend(p)
+    return (results, preds) if dump_preds else results
 
 
 def _save_crop_results(results: dict, crop: str, out_results: str) -> None:
