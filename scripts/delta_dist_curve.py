@@ -43,6 +43,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--out-csv", type=Path, default=Path("data/t3/delta_dist.csv"))
     parser.add_argument("--n-bins", type=int, default=8)
     parser.add_argument("--bootstrap", type=int, default=500)
+    parser.add_argument("--stat", default="delta",
+                        help="Per-env statistic column to plot against dist "
+                             "(delta = PCC - PCC(G+E); delta_fw = PCC - PCC(FW), M3 main metric)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda" if __import__("torch").cuda.is_available() else "cpu")
     return parser.parse_args(argv)
@@ -138,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
     # per-crop binned means + bootstrap CI
     frames = []
     for crop, g in df.groupby("crop"):
-        bc = bootstrap_ci(g["dist"].to_numpy(), g["delta"].to_numpy(), args.n_bins, args.bootstrap, args.seed)
+        bc = bootstrap_ci(g["dist"].to_numpy(), g[args.stat].to_numpy(), args.n_bins, args.bootstrap, args.seed)
         bc["crop"] = crop
         frames.append(bc)
     bins_df = pd.concat(frames, ignore_index=True)
@@ -147,18 +150,21 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[delta_dist] csv -> {args.out_csv}")
 
     # figure: scatter + binned mean ± CI + LOESS, per crop
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
-    for ax, (crop, g) in zip(axes, df.groupby("crop")):
-        ax.scatter(g["dist"], g["delta"], s=8, alpha=0.4, label=f"{crop} envs")
+    crops = list(df.groupby("crop"))
+    fig, axes = plt.subplots(1, len(crops), figsize=(6.5 * len(crops), 5), sharey=True)
+    if len(crops) == 1:
+        axes = [axes]
+    for ax, (crop, g) in zip(axes, crops):
+        ax.scatter(g["dist"], g[args.stat], s=8, alpha=0.4, label=f"{crop} envs")
         bc = bins_df[bins_df["crop"] == crop]
         ax.errorbar((bc["dist_lo"] + bc["dist_hi"]) / 2, bc["mean"],
                     yerr=[bc["mean"] - bc["ci_lo"], bc["ci_hi"] - bc["mean"]],
                     fmt="o-", color="red", capsize=3, label="binned mean ± 95% CI")
-        sm = lowess(g["delta"].to_numpy(), g["dist"].to_numpy(), frac=0.5)
+        sm = lowess(g[args.stat].to_numpy(), g["dist"].to_numpy(), frac=0.5)
         ax.plot(sm[:, 0], sm[:, 1], "--", color="blue", label="LOESS", alpha=0.7)
         ax.axhline(0, color="gray", lw=0.7)
         ax.set_xlabel("dist(e)  (env-feature Euclidean k-NN)")
-        ax.set_ylabel("Δ(e) = PCC(G∘z) − PCC(G+E)")
+        ax.set_ylabel(f"{args.stat}(e)")
         ax.set_title(f"{crop}  (n={len(g)})")
         ax.legend(fontsize=8)
     fig.suptitle("G×E predictability boundary: Δ vs environmental distance")

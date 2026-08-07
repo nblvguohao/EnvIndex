@@ -340,7 +340,15 @@ def _run_one_fold(
         # the heads (which expect d_embed) receive the right z dimension.
         flat = np.stack([np.nan_to_num(i["x"]).reshape(-1) for i in train_items])
         Xc = flat - flat.mean(0)
-        _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
+        try:
+            _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
+        except np.linalg.LinAlgError:
+            # OpenBLAS gesdd intermittently fails to converge where MKL succeeds
+            # (remote A100 box, barley PCA fold, 2026-08-07).  Eigendecompose the
+            # Gram matrix instead: flat_dim is small (<= ~300) so this is cheap
+            # and numerically equivalent (right singular vectors, desc order).
+            evals, evecs = np.linalg.eigh(Xc.T @ Xc)
+            Vt = evecs[:, ::-1].T
         flat_dim = flat.shape[1]
         W = np.zeros((flat_dim, d_embed), dtype=np.float32)
         k = min(flat_dim, d_embed)
@@ -437,7 +445,10 @@ def _init_worker(items, params, counter, lock, n_gpus):
     with lock:
         gpu = counter.value
         counter.value += 1
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu % n_gpus)
+    # LOE_GPU_BASE shifts the round-robin window so a busy GPU can be avoided
+    # without changing n_gpus (2026-08-06: shared A100 box, GPU 0 occupied).
+    base = int(os.environ.get("LOE_GPU_BASE", "0"))
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(base + gpu % n_gpus)
     _SHARED = {"items": items, "params": params}
 
 
