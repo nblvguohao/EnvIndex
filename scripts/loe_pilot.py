@@ -450,13 +450,15 @@ def _init_worker(items, params, counter, lock, n_gpus):
     import os
 
     global _SHARED
-    with lock:
-        gpu = counter.value
-        counter.value += 1
-    # LOE_GPU_BASE shifts the round-robin window so a busy GPU can be avoided
-    # without changing n_gpus (2026-08-06: shared A100 box, GPU 0 occupied).
-    base = int(os.environ.get("LOE_GPU_BASE", "0"))
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(base + gpu % n_gpus)
+    device = params[-1]
+    if device == "cuda":
+        with lock:
+            gpu = counter.value
+            counter.value += 1
+        # LOE_GPU_BASE shifts the round-robin window so a busy GPU can be avoided
+        # without changing n_gpus (2026-08-06: shared A100 box, GPU 0 occupied).
+        base = int(os.environ.get("LOE_GPU_BASE", "0"))
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(base + gpu % n_gpus)
     _SHARED = {"items": items, "params": params}
 
 
@@ -468,8 +470,8 @@ def _run_fold_worker(held):
     if n_held == 0:
         print(f"[worker] WARN no items for held={held}", flush=True)
         return held, {}, None
-    d_embed, d_geno, rank, epochs, batch_size, num_workers, seed, embed_mode, geno_offset, dump_preds = params
-    return _run_one_fold(items, held, d_embed, d_geno, rank, epochs, "cuda", seed, batch_size, num_workers, embed_mode, geno_offset, dump_preds)
+    d_embed, d_geno, rank, epochs, batch_size, num_workers, seed, embed_mode, geno_offset, dump_preds, device = params
+    return _run_one_fold(items, held, d_embed, d_geno, rank, epochs, device, seed, batch_size, num_workers, embed_mode, geno_offset, dump_preds)
 
 
 def run_loe(
@@ -512,7 +514,7 @@ def run_loe(
     # spawn (not fork): the parent has an initialized CUDA context; forking a
     # subprocess that uses CUDA raises "Cannot re-initialize CUDA".
     ctx = mp.get_context("spawn")
-    params = (d_embed, d_geno, rank, epochs, batch_size, num_workers, seed, embed_mode, geno_offset, dump_preds)
+    params = (d_embed, d_geno, rank, epochs, batch_size, num_workers, seed, embed_mode, geno_offset, dump_preds, device)
     counter = ctx.Manager().Value("i", 0)
     lock = ctx.Manager().Lock()
     results = {}
