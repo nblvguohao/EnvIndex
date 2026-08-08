@@ -223,7 +223,7 @@ EnvIndex 编码器 < 2M 参数，四臂 × 全 LOEO（400+ 环境）× 5 seed：
 
 ## 5. 基线墙（在 Paper 1 八条基础上扩展）
 
-1–8. 沿用 Paper 1：GBLUP-G、GBLUP-G+E、GBLUP-G∘E（Hadamard）、FW 反应范数、LightGBM、XGBoost、GEFormer、MeNet
+1–8. 沿用 Paper 1：GBLUP-G、GBLUP-G+E、GBLUP-G∘E（Hadamard）、FW 反应范数、LightGBM、XGBoost、GEFormer、MeNet。**状态核查（2026-08-08）**：GBLUP（`scripts/corn_gblup.py`）、FW、LightGBM 已实现；**GEFormer 已于 2026-08-08 依原文重实现**（`src/envindex/geformer.py`，见下方注记）并接入玉米 LOEO（`scripts/geformer_loe.py`）；MeNet 仍待实现（原协议声称"沿用 Paper 1"但两仓库中均无实现，此为一处已承认的未落地项）
 9. **envRtype-EC**：文献标准 enviromic 核（EC 矩阵 → 反应范数核），代表手工 envirotyping 路线
 10. **因子回归/MegaLMM-lite**：潜性状 × 环境协变量回归的简化复现，代表潜变量环境建模路线（完整 MegaLMM 引用对比，不必全量复现）[^7^]
 11. **AMMI**：每作物经典参照
@@ -233,6 +233,8 @@ EnvIndex 编码器 < 2M 参数，四臂 × 全 LOEO（400+ 环境）× 5 seed：
 15. **跨作物均值基线**：预测每个环境的产量为该作物的总体均值（零成本校准项，所有 R² 和 PCC 的锚点）
 
 CGM-GP（作物生长模型×基因组预测）路线：引用 Heslot/Technow/Messina 等结果做讨论定位，不复现——其需要作物模型参数化专家投入，超出纯公开数据+二人算力的范围 [^10^]。论文标题和声称范围明确限定在"统计 envirotyping 范式"内，将 CGM-GP 的扩展留作讨论中的未来工作。
+
+**GEFormer 基线实现注记（2026-08-08）**：作者发布仓库（`github.com/Deep-Breeding/GEFormer`）硬编码了其 75 因子玉米数据集的维度（`conv_env` in_channels=75、`Linear(125,76)`、`ODConv(env_days,env_days)` 要求通道==天数、DataEmbedding d_model=128 与 encoder 126 静默错位、gMLP `num_patches=200` 硬编码等），无法直接运行于本项目的 6 因子日气象 schema。因此**依论文架构忠实重实现**（`src/envindex/geformer.py`：gMLP 基因型分支 + ODConv/ProbSparse 线性注意力时序编码 + CrossGatedMLP 门控融合 + 756→256→32→1 头），参数化维度一致化，并以固定 150 日季节窗口（热锚定）接入玉米 269 环境 LOEO（`scripts/geformer_loe.py`），训练预算与 §7.2 重跑一致（60 epochs）。此差异须在论文方法/基线描述中如实声明（"依论文复现，非运行作者发布代码"）。
 
 **v1.1 实现进度**：GBLUP（`scripts/corn_gblup.py`，VanRaden GRM，玉米队列专属，h²=0.5 敏感性）、四作物 LightGBM（`scripts/lightgbm_loe.py`，环境协变量+折内基因型目标编码，玉米另加标记 top-32 PC）、pooled SelectionGain@10%（`scripts/pooled_selection_gain.py`，依赖 `run_loe(dump_preds=True)` 的逐 plot 原始尺度预测）、seed-ensemble 认知不确定性（`scripts/seed_ensemble_run.sh`，train-seed 1/2 复算，`--seed` 恒为 0 以保留 §7.2 权威队列）均已落地。
 
